@@ -9,8 +9,9 @@ const DEMO_TARGET = {
   dec: -7.245147
 };
 
-// SEC-19 is our demonstration entry point, not an official SPHEREx tile.
 const REAL_DEMO_SECTOR = 'SEC-19';
+const STATIC_IMAGE_PATH = '/data/target_cutout.png';
+const STATIC_OBSERVATION_DATE = '2025-05-05';
 
 // 1. Grab DOM elements
 const canvas = document.getElementById('sky-canvas');
@@ -111,10 +112,10 @@ let activeEpoch = 1;
 let viewMode = 'blink';
 let selectedTarget = null;
 
-// Real observation state
 let realObservation = false;
 let realObservationDate = null;
 let realObservationFile = null;
+let staticRealImage = false;
 
 let savedCandidates = JSON.parse(
   localStorage.getItem(STORAGE_KEY) || '[]'
@@ -213,7 +214,6 @@ function renderAllSkyMap() {
   ctx.fillStyle = '#080d1a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Simulated infrared Milky Way appearance
   const irIntensity = 0.08 + (band / 102) * 0.16;
 
   ctx.strokeStyle = `rgba(225, 29, 72, ${irIntensity})`;
@@ -237,7 +237,6 @@ function renderAllSkyMap() {
 
   ctx.stroke();
 
-  // Simulated background stars
   const skyRng = createSeededRng(999);
 
   for (let i = 0; i < 220; i++) {
@@ -248,7 +247,6 @@ function renderAllSkyMap() {
     ctx.fillRect(sx, sy, 1.3, 1.3);
   }
 
-  // Grid lines
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.2)';
   ctx.lineWidth = 1;
 
@@ -277,7 +275,6 @@ function renderAllSkyMap() {
     ctx.stroke();
   }
 
-  // Draw interactive sectors
   SECTORS.forEach(sector => {
     const box = getSectorScreenBox(sector);
 
@@ -334,7 +331,6 @@ function renderAllSkyMap() {
       ctx.fill();
     }
 
-    // Mark the real-data demonstration sector
     if (sector.id === REAL_DEMO_SECTOR) {
       ctx.strokeStyle = '#22c55e';
       ctx.lineWidth = 2;
@@ -349,7 +345,6 @@ function renderAllSkyMap() {
 
   ctx.restore();
 
-  // Outer ellipse border
   ctx.strokeStyle = '#38bdf8';
   ctx.lineWidth = 1.8;
   ctx.beginPath();
@@ -457,7 +452,6 @@ function drawReticle(x, y) {
 function renderSectorView() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // Real SPHEREx observation display
   if (realObservation && epoch1Source) {
     ctx.drawImage(
       epoch1Source,
@@ -467,8 +461,9 @@ function renderSectorView() {
       canvas.height
     );
 
-    viewportModeTag.textContent =
-      `SECTOR ${activeSector.id} // REAL SPHEREx DATA`;
+    viewportModeTag.textContent = staticRealImage
+      ? 'REAL SPHEREx — STATIC PREGENERATED OBSERVATION'
+      : `SECTOR ${activeSector.id} // REAL SPHEREx DATA`;
 
     hudReadout.textContent =
       `${realObservationFile} | ${realObservationDate}`;
@@ -476,7 +471,6 @@ function renderSectorView() {
     return;
   }
 
-  // Simulated data display
   if (viewMode === 'blink') {
     const src = activeEpoch === 1
       ? epoch1Source
@@ -498,24 +492,17 @@ function renderSectorView() {
     ctx.drawImage(epoch1Source, 0, 0);
 
     const e1 = ctx.getImageData(
-      0,
-      0,
-      canvas.width,
-      canvas.height
+      0, 0, canvas.width, canvas.height
     );
 
     ctx.drawImage(epoch2Source, 0, 0);
 
     const e2 = ctx.getImageData(
-      0,
-      0,
-      canvas.width,
-      canvas.height
+      0, 0, canvas.width, canvas.height
     );
 
     const out = ctx.createImageData(
-      canvas.width,
-      canvas.height
+      canvas.width, canvas.height
     );
 
     for (let i = 0; i < e1.data.length; i += 4) {
@@ -562,6 +549,10 @@ function enterSector(sector) {
   realObservation = false;
   realObservationDate = null;
   realObservationFile = null;
+  staticRealImage = false;
+
+  epoch1Source = null;
+  epoch2Source = null;
 
   canvas.classList.add('sector-mode');
 
@@ -598,6 +589,7 @@ function returnToAllSky() {
   realObservation = false;
   realObservationDate = null;
   realObservationFile = null;
+  staticRealImage = false;
 
   epoch1Source = null;
   epoch2Source = null;
@@ -621,7 +613,22 @@ function returnToAllSky() {
   renderFrame();
 }
 
-// 11. Load Real or Simulated Sky Patch
+// 11. Static SPHEREx image loader
+function loadStaticRealImage() {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+
+    img.onload = () => resolve(img);
+
+    img.onerror = () => reject(
+      new Error(`Could not load ${STATIC_IMAGE_PATH}`)
+    );
+
+    img.src = STATIC_IMAGE_PATH;
+  });
+}
+
+// 12. Load Real or Simulated Sky Patch
 async function loadSkyPatch(band) {
   if (viewportLevel === 'allsky') {
     renderAllSkyMap();
@@ -630,11 +637,11 @@ async function loadSkyPatch(band) {
 
   if (!activeSector) return;
 
-  // Try real SPHEREx data for the demonstration sector
   if (activeSector.id === REAL_DEMO_SECTOR) {
+    // First try the live Flask API.
     try {
       hudReadout.textContent =
-        'CONNECTING TO LOCAL SPHEREx DATA...';
+        'CONNECTING TO SPHEREx DATA API...';
 
       const url =
         `/api/cutout?ra=${DEMO_TARGET.ra}` +
@@ -654,7 +661,6 @@ async function loadSkyPatch(band) {
         throw new Error('No real FITS image was returned.');
       }
 
-      // Load returned base64 PNG
       const img = new Image();
 
       await new Promise((resolve, reject) => {
@@ -666,15 +672,14 @@ async function loadSkyPatch(band) {
         img.src = data.image;
       });
 
-      // Store real image
       epoch1Source = img;
       epoch2Source = null;
 
       realObservation = true;
       realObservationDate = data.date;
       realObservationFile = data.file;
+      staticRealImage = false;
 
-      // One real observation cannot support time comparison
       btnBlink.disabled = true;
       btnDipole.disabled = true;
       btnFlag.disabled = true;
@@ -687,22 +692,70 @@ async function loadSkyPatch(band) {
 
       renderSectorView();
 
-      console.log('Real SPHEREx image loaded:', data);
+      console.log('Real SPHEREx API image loaded:', data);
 
       return;
 
-    } catch (error) {
-      console.error('Real SPHEREx loading failed:', error);
+    } catch (apiError) {
+      console.warn(
+        'SPHEREx API unavailable. Trying static image:',
+        apiError
+      );
+    }
+
+    // If the API is unavailable, load the genuine pre-generated PNG.
+    try {
+      hudReadout.textContent =
+        'LOADING PREGENERATED SPHEREx OBSERVATION...';
+
+      const img = await loadStaticRealImage();
+
+      epoch1Source = img;
+      epoch2Source = null;
+
+      realObservation = true;
+      realObservationDate = STATIC_OBSERVATION_DATE;
+      realObservationFile = 'sample_spherex.fits';
+      staticRealImage = true;
+
+      btnBlink.disabled = true;
+      btnDipole.disabled = true;
+      btnFlag.disabled = true;
+
+      targetCoordsEl.textContent =
+        `WISE 0855 | RA ${DEMO_TARGET.ra}° | DEC ${DEMO_TARGET.dec}°`;
+
+      viewportModeTag.textContent =
+        'REAL SPHEREx — STATIC OBSERVATION';
 
       hudReadout.textContent =
-        'REAL DATA UNAVAILABLE — USING SIMULATION';
+        `PREGENERATED FITS CUTOUT | ${STATIC_OBSERVATION_DATE}`;
+
+      renderSectorView();
+
+      console.log(
+        'Loaded static genuine SPHEREx cutout:',
+        STATIC_IMAGE_PATH
+      );
+
+      return;
+
+    } catch (imageError) {
+      console.error(
+        'Static SPHEREx image unavailable:',
+        imageError
+      );
+
+      hudReadout.textContent =
+        'REAL IMAGE UNAVAILABLE — USING SIMULATION';
     }
   }
 
-  // Simulated fallback for other sectors or API errors
+  // Clearly simulated fallback for other sectors or unavailable images.
   realObservation = false;
   realObservationDate = null;
   realObservationFile = null;
+  staticRealImage = false;
 
   epoch1Source = buildMockEpochCanvas(
     activeSector,
@@ -723,7 +776,7 @@ async function loadSkyPatch(band) {
   renderSectorView();
 }
 
-// 12. Initialize 102-Band Demonstration Chart
+// 13. Initialize 102-Band Demonstration Chart
 const WAVELENGTHS = Array.from(
   { length: 102 },
   (_, i) => (0.75 + (i / 101) * 4.25).toFixed(2)
@@ -807,7 +860,7 @@ if (typeof Chart !== 'undefined') {
   }
 }
 
-// 13. Simulated Spectrum Generator
+// 14. Simulated Spectrum Generator
 function getMockSpectrum(sector, x, y) {
   const { mover } = getSectorData(sector);
 
@@ -860,7 +913,7 @@ function getMockSpectrum(sector, x, y) {
   });
 }
 
-// 14. Tab Navigation
+// 15. Tab Navigation
 function switchTab(tabName) {
   const isExplorer = tabName === 'explorer';
 
@@ -871,7 +924,7 @@ function switchTab(tabName) {
   tabCandidates.classList.toggle('active', !isExplorer);
 }
 
-// 15. Save Application State
+// 16. Save Application State
 function syncMemory() {
   localStorage.setItem(
     STORAGE_KEY,
@@ -894,7 +947,7 @@ function syncMemory() {
   renderCandidatesTable();
 }
 
-// 16. Candidate Table
+// 17. Candidate Table
 function renderCandidatesTable() {
   candidatesTbody.innerHTML = '';
 
@@ -961,7 +1014,6 @@ function renderCandidatesTable() {
 
       bannerWavelengthEl.textContent = wavelength;
 
-      // These are simulated candidate coordinates.
       activeEpoch = item.epoch || 1;
 
       selectedTarget = {
@@ -983,7 +1035,7 @@ function renderCandidatesTable() {
   });
 }
 
-// 17. Canvas Mouse Interaction
+// 18. Canvas Mouse Interaction
 function getCanvasCoords(e) {
   const rect = canvas.getBoundingClientRect();
 
@@ -1020,7 +1072,6 @@ function findSectorAtPoint(x, y) {
   );
 }
 
-// Hover interaction
 canvas.addEventListener('mousemove', (e) => {
   if (viewportLevel !== 'allsky') return;
 
@@ -1033,7 +1084,6 @@ canvas.addEventListener('mousemove', (e) => {
   }
 });
 
-// Click interaction
 canvas.addEventListener('click', async (e) => {
   const { x, y } = getCanvasCoords(e);
 
@@ -1047,8 +1097,6 @@ canvas.addEventListener('click', async (e) => {
     return;
   }
 
-  // Do not pretend canvas pixels have WCS coordinates.
-  // The real FITS image uses a separate coordinate system.
   if (realObservation) {
     return;
   }
@@ -1090,7 +1138,7 @@ canvas.addEventListener('click', async (e) => {
   btnFlag.textContent = 'Log Simulated Candidate';
 });
 
-// 18. Search Bar
+// 19. Search Bar
 sectorSearchInput.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
 
@@ -1114,7 +1162,7 @@ sectorSearchInput.addEventListener('keydown', (e) => {
   }
 });
 
-// 19. Navigation Buttons
+// 20. Navigation Buttons
 logoHome.addEventListener('click', (e) => {
   e.preventDefault();
 
@@ -1133,7 +1181,6 @@ tabCandidates.addEventListener('click', () => {
 
 btnBackAllSky.addEventListener('click', returnToAllSky);
 
-// Mark sector scanned
 btnMarkClear.addEventListener('click', () => {
   if (!activeSector) return;
 
@@ -1143,7 +1190,7 @@ btnMarkClear.addEventListener('click', () => {
   returnToAllSky();
 });
 
-// 20. Blink Button
+// 21. Blink Button
 btnBlink.addEventListener('click', () => {
   if (viewportLevel !== 'sector' || realObservation) {
     return;
@@ -1155,7 +1202,7 @@ btnBlink.addEventListener('click', () => {
   renderSectorView();
 });
 
-// 21. Dipole Button
+// 22. Dipole Button
 btnDipole.addEventListener('click', () => {
   if (viewportLevel !== 'sector' || realObservation) {
     return;
@@ -1166,7 +1213,7 @@ btnDipole.addEventListener('click', () => {
   renderSectorView();
 });
 
-// 22. Band Slider
+// 23. Band Slider
 bandSlider.addEventListener('input', (e) => {
   const band = Number(e.target.value);
 
@@ -1185,7 +1232,7 @@ bandSlider.addEventListener('input', (e) => {
   loadSkyPatch(band);
 });
 
-// 23. Keyboard Controls
+// 24. Keyboard Controls
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && isModalOpen()) {
     closeMissionModal();
@@ -1209,7 +1256,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-// 24. Flag Candidate
+// 25. Flag Candidate
 btnFlag.addEventListener('click', async () => {
   if (!selectedTarget || !activeSector || realObservation) {
     return;
@@ -1236,14 +1283,11 @@ btnFlag.addEventListener('click', async () => {
 
   syncMemory();
 
-  // Keep simulated candidates local.
-  // They are not confirmed astronomical discoveries.
-
   btnFlag.textContent = 'Simulated Candidate Logged ✓';
   btnFlag.disabled = true;
 });
 
-// 25. Export Candidates
+// 26. Export Candidates
 btnExportJson.addEventListener('click', () => {
   const blob = new Blob(
     [JSON.stringify(savedCandidates, null, 2)],
@@ -1261,7 +1305,7 @@ btnExportJson.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-// 26. Clear Candidate Log
+// 27. Clear Candidate Log
 btnClearLog.addEventListener('click', () => {
   savedCandidates = [];
   scannedSectors.clear();
@@ -1273,7 +1317,7 @@ btnClearLog.addEventListener('click', () => {
   }
 });
 
-// 27. Initialize App
+// 28. Initialize App
 syncMemory();
 renderAllSkyMap();
 

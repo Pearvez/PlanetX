@@ -1,8 +1,0 @@
-
-{
-  "functions": {
-    "server.py": {
-      "excludeFiles": "{tests/**,**/__pycache__/**,.venv/**,data/*.png}"
-    }
-  }
-}

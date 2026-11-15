@@ -4,6 +4,7 @@ from io import BytesIO
 from datetime import datetime, timezone
 import base64
 import json
+import os 
 
 import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
@@ -13,6 +14,7 @@ from astropy.nddata import Cutout2D
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
 import astropy.units as u
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -20,7 +22,9 @@ import matplotlib.pyplot as plt
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-CANDIDATES_FILE = DATA_DIR / "candidates.json"
+
+# Vercel functions have temporary writable storage.
+CANDIDATES_FILE = Path("/tmp/planetx_candidates.json")
 
 app = Flask(__name__)
 
@@ -29,6 +33,9 @@ def get_fits_files():
     """Find FITS files stored in the project's data directory."""
     patterns = ("*.fits", "*.fits.gz", "*.fit", "*.fts")
     files = []
+
+    if not DATA_DIR.exists():
+        return files
 
     for pattern in patterns:
         files.extend(DATA_DIR.glob(pattern))
@@ -72,6 +79,7 @@ def make_image_data_url(data):
     ax.set_axis_off()
 
     buffer = BytesIO()
+
     fig.savefig(
         buffer,
         format="png",
@@ -79,6 +87,7 @@ def make_image_data_url(data):
         pad_inches=0,
         dpi=140
     )
+
     plt.close(fig)
 
     encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -100,12 +109,21 @@ def stylesheet():
     return send_from_directory(ROOT, "styles.css")
 
 
+@app.get("/data/<path:filename>")
+def serve_data(filename):
+    """Serve files from the project's data directory."""
+    return send_from_directory(DATA_DIR, filename)
+
+
 @app.get("/api/health")
 def health():
+    """Check whether the deployed Flask backend can find FITS data."""
     files = get_fits_files()
 
     return jsonify({
         "status": "ok",
+        "backend": "Flask",
+        "project": "PlanetX",
         "fits_files_found": len(files),
         "files": [file.name for file in files]
     })
@@ -113,13 +131,13 @@ def health():
 
 @app.get("/api/observations")
 def observations():
-    """List local FITS files whose WCS contains the requested coordinate."""
+    """Find FITS observations covering the requested coordinates."""
     try:
         ra = float(request.args["ra"])
         dec = float(request.args["dec"])
 
         if not 0 <= ra < 360 or not -90 <= dec <= 90:
-            raise ValueError("RA or Dec is outside its valid range.")
+            raise ValueError("Invalid coordinates.")
 
     except (KeyError, ValueError):
         return jsonify({
@@ -133,6 +151,10 @@ def observations():
         try:
             with fits.open(path, memmap=True) as hdul:
                 hdu = hdul["IMAGE"] if "IMAGE" in hdul else hdul[0]
+
+                if hdu.data is None: # type: ignore
+                    continue
+
                 wcs = WCS(hdu.header) # type: ignore
 
                 if not wcs.has_celestial:
@@ -169,10 +191,10 @@ def cutout():
         size = float(request.args.get("size", "0.05"))
 
         if not 0 <= ra < 360 or not -90 <= dec <= 90:
-            raise ValueError("RA or Dec is outside its valid range.")
+            raise ValueError("Invalid coordinates.")
 
         if not 0 < size <= 2:
-            raise ValueError("Cutout size must be greater than 0 and at most 2 degrees.")
+            raise ValueError("Invalid cutout size.")
 
     except (KeyError, ValueError):
         return jsonify({
@@ -239,9 +261,9 @@ def save_candidate():
     candidate = request.get_json(silent=True)
 
     if not isinstance(candidate, dict):
-        return jsonify({"error": "Expected a JSON candidate object."}), 400
-
-    DATA_DIR.mkdir(exist_ok=True)
+        return jsonify({
+            "error": "Expected a JSON candidate object."
+        }), 400
 
     try:
         if CANDIDATES_FILE.exists():
@@ -253,7 +275,9 @@ def save_candidate():
             candidates = []
 
         candidates.append(candidate)
-        CANDIDATES_FILE.write_text(json.dumps(candidates, indent=2))
+        CANDIDATES_FILE.write_text(
+            json.dumps(candidates, indent=2)
+        )
 
         return jsonify({
             "status": "saved",

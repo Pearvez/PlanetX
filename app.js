@@ -1,25 +1,43 @@
 
-const USE_MOCK_DATA = true;
-const STORAGE_KEY = 'spherex_candidates';
-const SCANNED_KEY = 'spherex_scanned_sectors';
+// ============================================================
+// PLANETX — FULL-SKY SPHEREx EXPLORER
+// Uses the SPHEREx DR1 HiPS PNG endpoint through Flask.
+// ============================================================
+
+// ==========================================
+// 1. CONFIGURATION
+// ==========================================
 
 const API_BASE = '';
 
-const DEMO_TARGET = {
-  ra: 133.795129,
-  dec: -7.245147
-};
+const STORAGE_KEY = 'spherex_candidates';
+const SCANNED_KEY = 'spherex_scanned_sectors';
 
-const REAL_DEMO_SECTOR = 'SEC-19';
-const STATIC_IMAGE_PATH = '/data/target_cutout.png';
-const STATIC_OBSERVATION_DATE = '2025-05-05';
+const TOTAL_SKY_TILES = 12288;
+const TOTAL_CHANNELS = 102;
+const TILE_PAGE_SIZE = 1000;
+
+let SECTORS = [];
+let tilesLoaded = false;
+let hoveredSector = null;
+let activeSector = null;
+let viewportLevel = 'allsky';
+
+let realObservation = false;
+let epoch1Source = null;
+
+let tileRequestNumber = 0;
+let tileDataStatus = 'Connecting to SPHEREx...';
+
+let savedCandidates = loadLocalArray(STORAGE_KEY);
+let scannedSectors = new Set(loadLocalArray(SCANNED_KEY));
 
 // ==========================================
-// 1. DOM ELEMENTS
+// 2. DOM ELEMENTS
 // ==========================================
 
 const canvas = document.getElementById('sky-canvas');
-const ctx = canvas.getContext('2d');
+const ctx = canvas ? canvas.getContext('2d') : null;
 
 const sectorSearchInput = document.getElementById('sector-search');
 const logoHome = document.getElementById('logo-home');
@@ -60,7 +78,26 @@ const btnExportJson = document.getElementById('btn-export-json');
 const btnClearLog = document.getElementById('btn-clear-log');
 
 // ==========================================
-// 2. BACKEND CONNECTION
+// 3. LOCAL STORAGE
+// ==========================================
+
+function loadLocalArray(key) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch (error) {
+    console.warn(`Could not load ${key}:`, error);
+    return [];
+  }
+}
+
+function saveLocalState() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCandidates));
+  localStorage.setItem(SCANNED_KEY, JSON.stringify([...scannedSectors]));
+}
+
+// ==========================================
+// 4. BACKEND CONNECTION
 // ==========================================
 
 let backendConnected = false;
@@ -70,7 +107,7 @@ async function checkBackend() {
     const response = await fetch(`${API_BASE}/api/health`);
 
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(`Backend returned HTTP ${response.status}`);
     }
 
     const data = await response.json();
@@ -79,477 +116,356 @@ async function checkBackend() {
 
     console.log('PLANETX BACKEND:', data);
 
-    return backendConnected;
+    if (!backendConnected) {
+      throw new Error('Backend health check was unsuccessful.');
+    }
+
+    return true;
 
   } catch (error) {
     backendConnected = false;
-
     console.error('BACKEND CONNECTION FAILED:', error);
-
     return false;
   }
 }
 
-async function fetchSpherexCutout(ra, dec, size = 0.05) {
+// ==========================================
+// 5. LOAD ALL 12,288 SKY TILE POSITIONS
+// ==========================================
+
+async function loadAllSkyTiles() {
   try {
-    const params = new URLSearchParams({
-      ra: String(ra),
-      dec: String(dec),
-      size: String(size)
-    });
+    SECTORS = [];
+    tilesLoaded = false;
 
-    const response = await fetch(
-      `${API_BASE}/api/cutout?${params.toString()}`
-    );
+    tileDataStatus = 'Loading HEALPix sky positions...';
+    renderAllSkyMap();
 
-    if (!response.ok) {
-      throw new Error(`Cutout API returned HTTP ${response.status}`);
+    for (
+      let offset = 0;
+      offset < TOTAL_SKY_TILES;
+      offset += TILE_PAGE_SIZE
+    ) {
+      const params = new URLSearchParams({
+        offset: String(offset),
+        limit: String(TILE_PAGE_SIZE)
+      });
+
+      const response = await fetch(
+        `${API_BASE}/api/sky/tiles?${params.toString()}`
+      );
+
+      if (!response.ok) {
+        throw new Error(`Tile endpoint returned HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (
+        data.status !== 'ok' ||
+        !Array.isArray(data.tiles)
+      ) {
+        throw new Error('Invalid tile list received.');
+      }
+
+      for (const tile of data.tiles) {
+        SECTORS.push({
+          id: `TILE-${String(tile.id).padStart(5, '0')}`,
+          tileId: Number(tile.id),
+          index: Number(tile.id),
+          ra: Number(tile.ra),
+          dec: Number(tile.dec),
+          status: tile.status || 'not_checked'
+        });
+      }
+
+      tileDataStatus =
+        `Loading tile positions: ${SECTORS.length.toLocaleString()} / ${TOTAL_SKY_TILES.toLocaleString()}`;
+
+      renderAllSkyMap();
     }
 
-    const data = await response.json();
-
-    if (data.status !== 'real_data' || !data.image) {
-      throw new Error(data.message || 'No real image returned.');
+    if (SECTORS.length !== TOTAL_SKY_TILES) {
+      throw new Error(
+        `Expected ${TOTAL_SKY_TILES} tiles but received ${SECTORS.length}.`
+      );
     }
 
-    return data;
+    tilesLoaded = true;
+
+    tileDataStatus =
+      `${SECTORS.length.toLocaleString()} HEALPix tile positions loaded.`;
+
+    console.log('FULL SKY LOADED:', SECTORS.length);
+
+    syncMemory();
+    renderAllSkyMap();
 
   } catch (error) {
-    console.error('SPHEREx API ERROR:', error);
-    return null;
+    tilesLoaded = false;
+
+    tileDataStatus = `Could not load sky positions: ${error.message}`;
+
+    console.error('FULL SKY LOAD ERROR:', error);
+
+    renderAllSkyMap();
   }
 }
 
 // ==========================================
-// 3. MODAL CONTROLS
+// 6. MODAL CONTROLS
 // ==========================================
 
 function openMissionModal() {
-  missionModal.classList.remove('hidden');
+  if (missionModal) missionModal.classList.remove('hidden');
 }
 
 function closeMissionModal() {
-  missionModal.classList.add('hidden');
+  if (missionModal) missionModal.classList.add('hidden');
 }
 
 function isModalOpen() {
-  return !missionModal.classList.contains('hidden');
+  return missionModal &&
+    !missionModal.classList.contains('hidden');
 }
 
-btnCloseModal.addEventListener('click', closeMissionModal);
-btnStartExploring.addEventListener('click', closeMissionModal);
-btnOpenGuide.addEventListener('click', openMissionModal);
-exploreTrigger.addEventListener('click', openMissionModal);
+btnCloseModal?.addEventListener('click', closeMissionModal);
+btnStartExploring?.addEventListener('click', closeMissionModal);
+btnOpenGuide?.addEventListener('click', openMissionModal);
+exploreTrigger?.addEventListener('click', openMissionModal);
 
-missionModal.addEventListener('click', e => {
-  if (e.target === missionModal) {
+missionModal?.addEventListener('click', event => {
+  if (event.target === missionModal) {
     closeMissionModal();
   }
 });
 
 // ==========================================
-// 4. DEMONSTRATION SECTORS
+// 7. SKY COORDINATE PROJECTION
 // ==========================================
 
-const GRID_COLS = 8;
-const GRID_ROWS = 4;
-const SECTORS = [];
+// Equirectangular display projection.
+// HEALPix tile centers are converted to screen positions.
 
-for (let r = 0; r < GRID_ROWS; r++) {
-  for (let c = 0; c < GRID_COLS; c++) {
-    const idx = r * GRID_COLS + c + 1;
-    const id = `SEC-${String(idx).padStart(2, '0')}`;
-
-    const ra = Number(((c + 0.5) * (360 / GRID_COLS)).toFixed(1));
-    const dec = Number((67.5 - r * 45).toFixed(1));
-
-    SECTORS.push({
-      id,
-      index: idx,
-      col: c,
-      row: r,
-      ra,
-      dec
-    });
-  }
-}
-
-// ==========================================
-// 5. APPLICATION STATE
-// ==========================================
-
-let viewportLevel = 'allsky';
-let activeSector = null;
-let hoveredSector = null;
-
-let epoch1Source = null;
-let epoch2Source = null;
-
-let activeEpoch = 1;
-let viewMode = 'blink';
-let selectedTarget = null;
-
-let realObservation = false;
-let realObservationDate = null;
-let realObservationFile = null;
-let staticRealImage = false;
-
-let savedCandidates = JSON.parse(
-  localStorage.getItem(STORAGE_KEY) || '[]'
-);
-
-let scannedSectors = new Set(
-  JSON.parse(localStorage.getItem(SCANNED_KEY) || '[]')
-);
-
-// ==========================================
-// 6. SEEDED RANDOM GENERATOR
-// ==========================================
-
-function createSeededRng(seed) {
-  let s = seed * 2654435761;
-
-  return function () {
-    s = (s ^ (s >>> 15)) * 2246822519;
-    s = (s ^ (s >>> 13)) * 3266489917;
-
-    return ((s ^ (s >>> 16)) >>> 0) / 4294967296;
-  };
-}
-
-function getSectorData(sector) {
-  const rng = createSeededRng(sector.index * 137);
-
-  const stars = Array.from({ length: 65 }, () => ({
-    x: Math.floor(rng() * (canvas.width - 32)) + 16,
-    y: Math.floor(rng() * (canvas.height - 32)) + 16,
-    brightness: Math.floor(110 + rng() * 145),
-    radius: 1.2 + rng() * 1.2
-  }));
-
-  const hasMover = sector.index % 4 !== 0;
-  const isSlowColdObject = sector.index % 2 === 1;
-
-  const mover = hasMover
-    ? {
-        e1x: Math.floor(120 + rng() * (canvas.width - 240)),
-        e1y: Math.floor(80 + rng() * (canvas.height - 160)),
-        dx: isSlowColdObject
-          ? Math.floor(18 + rng() * 16)
-          : Math.floor(45 + rng() * 35),
-        dy: isSlowColdObject
-          ? Math.floor(-12 + rng() * 24)
-          : Math.floor(-30 + rng() * 60),
-        type: isSlowColdObject ? 'cold_ir' : 'asteroid'
-      }
-    : null;
-
-  return { stars, mover };
-}
-
-// ==========================================
-// 7. ALL-SKY MAP
-// ==========================================
-
-const MAP_CX = canvas.width / 2;
-const MAP_CY = canvas.height / 2;
-const MAP_RX = 296;
-const MAP_RY = 156;
-
-function getSectorScreenBox(sector) {
-  const gridLeft = MAP_CX - MAP_RX;
-  const gridTop = MAP_CY - MAP_RY;
-
-  const cellW = (MAP_RX * 2) / GRID_COLS;
-  const cellH = (MAP_RY * 2) / GRID_ROWS;
-
+function skyToScreen(ra, dec) {
   return {
-    x: gridLeft + sector.col * cellW,
-    y: gridTop + sector.row * cellH,
-    w: cellW,
-    h: cellH
+    x: (ra / 360) * canvas.width,
+    y: ((90 - dec) / 180) * canvas.height
   };
 }
+
+function screenToSky(x, y) {
+  return {
+    ra: Math.max(
+      0,
+      Math.min(359.999999, (x / canvas.width) * 360)
+    ),
+
+    dec: Math.max(
+      -90,
+      Math.min(90, 90 - (y / canvas.height) * 180)
+    )
+  };
+}
+
+// ==========================================
+// 8. FIND CLOSEST SKY TILE
+// ==========================================
+
+function findSectorAtPoint(x, y) {
+  if (!SECTORS.length) return null;
+
+  let closest = null;
+  let closestDistance = Infinity;
+
+  for (const sector of SECTORS) {
+    const point = skyToScreen(sector.ra, sector.dec);
+
+    let dx = Math.abs(x - point.x);
+
+    // RA wraps around at 0° and 360°.
+    dx = Math.min(dx, canvas.width - dx);
+
+    const dy = y - point.y;
+    const distance = dx * dx + dy * dy;
+
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closest = sector;
+    }
+  }
+
+  // Choose the closest tile center.
+  // This allows users to select the nearest tile
+  // even when tile centers are close together.
+
+  return closest;
+}
+
+// ==========================================
+// 9. FULL-SKY MAP RENDERER
+// ==========================================
 
 function renderAllSkyMap() {
-  const band = Number(bandSlider.value);
+  if (!canvas || !ctx) return;
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   ctx.fillStyle = '#020308';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  ctx.save();
+  // Coordinate grid.
 
-  ctx.beginPath();
-  ctx.ellipse(MAP_CX, MAP_CY, MAP_RX, MAP_RY, 0, 0, Math.PI * 2);
-  ctx.clip();
-
-  ctx.fillStyle = '#080d1a';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  const irIntensity = 0.08 + (band / 102) * 0.16;
-
-  ctx.strokeStyle = `rgba(225, 29, 72, ${irIntensity})`;
-  ctx.lineWidth = 34;
-  ctx.beginPath();
-
-  for (let x = MAP_CX - MAP_RX; x <= MAP_CX + MAP_RX; x += 8) {
-    const normX = (x - MAP_CX) / MAP_RX;
-    const galY = MAP_CY + Math.sin(normX * Math.PI) * 65;
-
-    if (x === MAP_CX - MAP_RX) {
-      ctx.moveTo(x, galY);
-    } else {
-      ctx.lineTo(x, galY);
-    }
-  }
-
-  ctx.stroke();
-
-  const skyRng = createSeededRng(999);
-
-  for (let i = 0; i < 220; i++) {
-    const sx = MAP_CX - MAP_RX + skyRng() * MAP_RX * 2;
-    const sy = MAP_CY - MAP_RY + skyRng() * MAP_RY * 2;
-
-    ctx.fillStyle = `rgba(248, 250, 252, ${0.25 + skyRng() * 0.6})`;
-    ctx.fillRect(sx, sy, 1.3, 1.3);
-  }
-
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.2)';
+  ctx.strokeStyle = 'rgba(100, 116, 139, 0.25)';
   ctx.lineWidth = 1;
 
-  for (let i = -2; i <= 2; i++) {
+  for (let ra = 0; ra <= 360; ra += 30) {
+    const x = (ra / 360) * canvas.width;
+
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, canvas.height);
+    ctx.stroke();
+  }
+
+  for (let dec = -60; dec <= 60; dec += 30) {
+    const y = ((90 - dec) / 180) * canvas.height;
+
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(canvas.width, y);
+    ctx.stroke();
+  }
+
+  // Coordinate labels.
+
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
+  ctx.font = '10px monospace';
+
+  for (let ra = 0; ra < 360; ra += 60) {
+    const x = (ra / 360) * canvas.width + 4;
+    ctx.fillText(`${ra}° RA`, x, 14);
+  }
+
+  for (let dec = -60; dec <= 60; dec += 30) {
+    const y = ((90 - dec) / 180) * canvas.height;
+    ctx.fillText(`${dec}°`, 5, y - 4);
+  }
+
+  // Plot every HEALPix tile center.
+
+  for (const sector of SECTORS) {
+    const point = skyToScreen(sector.ra, sector.dec);
+
+    const isHovered =
+      hoveredSector &&
+      hoveredSector.tileId === sector.tileId;
+
+    const hasCandidate = savedCandidates.some(
+      candidate => Number(candidate.tileId) === sector.tileId
+    );
+
+    const isScanned = scannedSectors.has(
+      String(sector.tileId)
+    );
+
+    if (hasCandidate) {
+      ctx.fillStyle = '#f59e0b';
+    } else if (isHovered) {
+      ctx.fillStyle = '#38bdf8';
+    } else if (isScanned) {
+      ctx.fillStyle = '#22c55e';
+    } else {
+      ctx.fillStyle = 'rgba(125, 211, 252, 0.65)';
+    }
+
     ctx.beginPath();
 
-    ctx.ellipse(
-      MAP_CX,
-      MAP_CY,
-      Math.abs(i) * (MAP_RX / 3) || 2,
-      MAP_RY,
-      0,
+    ctx.arc(
+      point.x,
+      point.y,
+      isHovered ? 4 : 1.5,
       0,
       Math.PI * 2
     );
 
-    ctx.stroke();
+    ctx.fill();
   }
 
-  for (let r = 1; r < GRID_ROWS; r++) {
-    const y = MAP_CY - MAP_RY + (r * MAP_RY * 2) / GRID_ROWS;
+  // Highlight selected tile.
 
-    ctx.beginPath();
-    ctx.moveTo(MAP_CX - MAP_RX, y);
-    ctx.lineTo(MAP_CX + MAP_RX, y);
-    ctx.stroke();
-  }
-
-  SECTORS.forEach(sector => {
-    const box = getSectorScreenBox(sector);
-
-    const hasCandidate = savedCandidates.some(
-      c => (c.sectorId || 'SEC-01') === sector.id
+  if (activeSector) {
+    const point = skyToScreen(
+      activeSector.ra,
+      activeSector.dec
     );
 
-    const isScanned = scannedSectors.has(sector.id);
-    const isHovered = hoveredSector && hoveredSector.id === sector.id;
+    ctx.strokeStyle = '#22c55e';
+    ctx.lineWidth = 2;
 
-    if (hasCandidate) {
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.18)';
-      ctx.fillRect(box.x, box.y, box.w, box.h);
-    } else if (isScanned) {
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.14)';
-      ctx.fillRect(box.x, box.y, box.w, box.h);
-    }
-
-    if (isHovered) {
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.28)';
-      ctx.fillRect(box.x, box.y, box.w, box.h);
-
-      ctx.strokeStyle = '#38bdf8';
-      ctx.lineWidth = 1.5;
-      ctx.strokeRect(box.x + 1, box.y + 1, box.w - 2, box.h - 2);
-    } else {
-      ctx.strokeStyle = 'rgba(51, 65, 85, 0.65)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(box.x, box.y, box.w, box.h);
-    }
-
-    ctx.fillStyle = isHovered ? '#f8fafc' : 'rgba(148, 163, 184, 0.7)';
-    ctx.font = '9px "JetBrains Mono", monospace';
-    ctx.fillText(sector.id, box.x + 5, box.y + 13);
-
-    if (hasCandidate) {
-      ctx.fillStyle = '#f59e0b';
-      ctx.beginPath();
-      ctx.arc(box.x + box.w - 10, box.y + box.h - 10, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    if (sector.id === REAL_DEMO_SECTOR) {
-      ctx.strokeStyle = '#22c55e';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(box.x + 3, box.y + 3, box.w - 6, box.h - 6);
-    }
-  });
-
-  ctx.restore();
-
-  ctx.strokeStyle = '#38bdf8';
-  ctx.lineWidth = 1.8;
-  ctx.beginPath();
-  ctx.ellipse(MAP_CX, MAP_CY, MAP_RX, MAP_RY, 0, 0, Math.PI * 2);
-  ctx.stroke();
-
-  viewportModeTag.textContent = 'ALL-SKY DEMONSTRATION PROJECTION';
-
-  hudReadout.textContent = hoveredSector
-    ? `${hoveredSector.id} // RA ${hoveredSector.ra}° DEC ${hoveredSector.dec}°`
-    : 'GREEN OUTLINE = REAL-DATA DEMO SECTOR | CLICK TO INSPECT';
-}
-
-// ==========================================
-// 8. SIMULATED EPOCHS
-// ==========================================
-
-function buildMockEpochCanvas(sector, epochNum, band) {
-  const offscreen = document.createElement('canvas');
-
-  offscreen.width = canvas.width;
-  offscreen.height = canvas.height;
-
-  const octx = offscreen.getContext('2d');
-
-  octx.fillStyle = '#020308';
-  octx.fillRect(0, 0, canvas.width, canvas.height);
-
-  const { stars, mover } = getSectorData(sector);
-
-  stars.forEach(star => {
-    octx.fillStyle =
-      `rgb(${star.brightness}, ${star.brightness}, ${star.brightness})`;
-
-    octx.beginPath();
-    octx.arc(star.x, star.y, star.radius, 0, Math.PI * 2);
-    octx.fill();
-  });
-
-  if (mover) {
-    const targetX = epochNum === 1 ? mover.e1x : mover.e1x + mover.dx;
-    const targetY = epochNum === 1 ? mover.e1y : mover.e1y + mover.dy;
-
-    const irGlow = mover.type === 'cold_ir'
-      ? Math.min(255, Math.floor(40 + (band / 102) * 215))
-      : Math.min(255, Math.floor(220 - (band / 102) * 110));
-
-    octx.fillStyle = `rgb(${irGlow}, ${irGlow}, ${irGlow})`;
-    octx.beginPath();
-    octx.arc(targetX, targetY, 3, 0, Math.PI * 2);
-    octx.fill();
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 8, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
-  return offscreen;
+  viewportModeTag.textContent =
+    'FULL SKY // HEALPIX NESTED // 12,288 TILE POSITIONS';
+
+  hudReadout.textContent = hoveredSector
+    ? `TILE ${hoveredSector.tileId} | RA ${hoveredSector.ra.toFixed(3)}° | DEC ${hoveredSector.dec.toFixed(3)}°`
+    : tileDataStatus;
 }
 
 // ==========================================
-// 9. RETICLE
-// ==========================================
-
-function drawReticle(x, y) {
-  const size = 14;
-  const gap = 5;
-
-  ctx.strokeStyle = '#e11d48';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-
-  ctx.moveTo(x - size, y - gap);
-  ctx.lineTo(x - size, y - size);
-  ctx.lineTo(x - gap, y - size);
-
-  ctx.moveTo(x + gap, y - size);
-  ctx.lineTo(x + size, y - size);
-  ctx.lineTo(x + size, y - gap);
-
-  ctx.moveTo(x - size, y + gap);
-  ctx.lineTo(x - size, y + size);
-  ctx.lineTo(x - gap, y + size);
-
-  ctx.moveTo(x + gap, y + size);
-  ctx.lineTo(x + size, y + size);
-  ctx.lineTo(x + size, y + gap);
-
-  ctx.stroke();
-}
-
-// ==========================================
-// 10. SECTOR RENDERER
+// 10. RENDER SELECTED TILE
 // ==========================================
 
 function renderSectorView() {
+  if (!canvas || !ctx) return;
+
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  if (realObservation && epoch1Source) {
-    ctx.drawImage(epoch1Source, 0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#020308';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    viewportModeTag.textContent = staticRealImage
-      ? 'REAL SPHEREx — STATIC PREGENERATED OBSERVATION'
-      : `SECTOR ${activeSector.id} // REAL SPHEREx DATA`;
+  if (realObservation && epoch1Source) {
+    ctx.drawImage(
+      epoch1Source,
+      0,
+      0,
+      canvas.width,
+      canvas.height
+    );
+
+    viewportModeTag.textContent =
+      'REAL SPHEREx DR1 // HiPS PNG TILE';
 
     hudReadout.textContent =
-      `${realObservationFile} | ${realObservationDate}`;
+      `HEALPix TILE ${activeSector.tileId} | CHANNEL ${bandSlider.value}`;
 
     return;
   }
 
-  if (viewMode === 'blink') {
-    const src = activeEpoch === 1 ? epoch1Source : epoch2Source;
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = '13px monospace';
+  ctx.textAlign = 'center';
 
-    if (src) {
-      ctx.drawImage(src, 0, 0);
-    }
+  const lines = tileDataStatus.split('\n');
 
-    viewportModeTag.textContent =
-      `SECTOR ${activeSector.id} // SIMULATED BLINK`;
+  lines.forEach((line, index) => {
+    ctx.fillText(
+      line,
+      canvas.width / 2,
+      canvas.height / 2 + index * 22
+    );
+  });
 
-    hudReadout.textContent =
-      `SIMULATED EPOCH ${activeEpoch} — NOT REAL OBSERVATION DATA`;
+  ctx.textAlign = 'start';
 
-  } else if (viewMode === 'dipole') {
-    if (!epoch1Source || !epoch2Source) return;
+  viewportModeTag.textContent =
+    'SPHEREx TILE // WAITING FOR IMAGE';
 
-    ctx.drawImage(epoch1Source, 0, 0);
-
-    const e1 = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-    ctx.drawImage(epoch2Source, 0, 0);
-
-    const e2 = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-    const out = ctx.createImageData(canvas.width, canvas.height);
-
-    for (let i = 0; i < e1.data.length; i += 4) {
-      const diff = e2.data[i] - e1.data[i];
-
-      out.data[i] = diff > 15 ? diff * 2 : 0;
-      out.data[i + 1] = 0;
-      out.data[i + 2] = diff < -15 ? -diff * 2 : 0;
-      out.data[i + 3] = 255;
-    }
-
-    ctx.putImageData(out, 0, 0);
-
-    viewportModeTag.textContent =
-      `SECTOR ${activeSector.id} // SIMULATED DIFFERENCE`;
-
-    hudReadout.textContent =
-      'SIMULATION ONLY — RED/BLUE SHOW MOCK PIXEL DIFFERENCES';
-  }
-
-  if (selectedTarget) {
-    drawReticle(selectedTarget.x, selectedTarget.y);
-  }
+  hudReadout.textContent = tileDataStatus;
 }
 
 function renderFrame() {
@@ -561,77 +477,185 @@ function renderFrame() {
 }
 
 // ==========================================
-// 11. ENTER SECTOR
+// 11. LOAD A REAL SPHEREx PNG TILE
 // ==========================================
 
-function enterSector(sector) {
+async function loadSkyPatch(channel) {
+  if (!activeSector || viewportLevel !== 'sector') {
+    return;
+  }
+
+  const thisRequest = ++tileRequestNumber;
+
+  const frame = Math.max(
+    1,
+    Math.min(TOTAL_CHANNELS, Number(channel))
+  );
+
+  realObservation = false;
+  epoch1Source = null;
+
+  tileDataStatus =
+    `Requesting tile ${activeSector.tileId}, channel ${frame}...`;
+
+  renderSectorView();
+
+  try {
+    const params = new URLSearchParams({
+      ra: String(activeSector.ra),
+      dec: String(activeSector.dec),
+      channel: String(frame)
+    });
+
+    const response = await fetch(
+      `${API_BASE}/api/sky/tile?${params.toString()}`
+    );
+
+    const data = await response.json();
+
+    if (thisRequest !== tileRequestNumber) {
+      return;
+    }
+
+    if (!response.ok || data.status !== 'ok') {
+      throw new Error(
+        data.error || `SPHEREx returned HTTP ${response.status}`
+      );
+    }
+
+    const imageUrl = data.data_url ||
+      (data.image
+        ? `data:image/png;base64,${data.image}`
+        : null);
+
+    if (!imageUrl) {
+      throw new Error('No image was returned by the archive.');
+    }
+
+    const image = new Image();
+
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+
+      image.onerror = () => reject(
+        new Error('Could not decode the SPHEREx PNG image.')
+      );
+
+      image.src = imageUrl;
+    });
+
+    if (thisRequest !== tileRequestNumber) {
+      return;
+    }
+
+    epoch1Source = image;
+    realObservation = true;
+
+    tileDataStatus =
+      `REAL SPHEREx DATA | Tile ${data.tile_id} | Channel ${frame}`;
+
+    targetCoordsEl.textContent =
+      `RA ${activeSector.ra.toFixed(4)}° | DEC ${activeSector.dec.toFixed(4)}°`;
+
+    btnBlink.disabled = true;
+    btnDipole.disabled = true;
+    btnFlag.disabled = true;
+
+    renderSectorView();
+
+    console.log('REAL SPHEREx TILE LOADED:', {
+      tile: data.tile_id,
+      channel: frame,
+      width: data.image_width,
+      height: data.image_height,
+      source: data.source
+    });
+
+  } catch (error) {
+    if (thisRequest !== tileRequestNumber) {
+      return;
+    }
+
+    realObservation = false;
+    epoch1Source = null;
+
+    tileDataStatus =
+      `No image available for this tile/channel.\n${error.message}`;
+
+    console.error('SPHEREx TILE ERROR:', error);
+
+    renderSectorView();
+  }
+}
+
+// ==========================================
+// 12. ENTER A SKY TILE
+// ==========================================
+
+async function enterSector(sector) {
+  if (!sector) return;
+
   activeSector = sector;
   viewportLevel = 'sector';
 
-  viewMode = 'blink';
-  activeEpoch = 1;
-  selectedTarget = null;
-
   realObservation = false;
-  realObservationDate = null;
-  realObservationFile = null;
-  staticRealImage = false;
-
   epoch1Source = null;
-  epoch2Source = null;
 
   canvas.classList.add('sector-mode');
 
-  sectorTitleEl.textContent = `Sector ${sector.id}`;
+  sectorTitleEl.textContent =
+    `Sky Tile ${sector.tileId}`;
 
   sectorBadge.textContent =
-    `Grid Coordinates: RA ${sector.ra}°, Dec ${sector.dec}°`;
+    `HEALPix NESTED | RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
 
-  targetCoordsEl.textContent = 'Click an object in this sector...';
+  targetCoordsEl.textContent =
+    `RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
 
   btnBackAllSky.disabled = false;
   btnMarkClear.disabled = false;
 
-  btnBlink.disabled = false;
-  btnDipole.disabled = false;
+  // These controls are disabled because a single PNG
+  // does not provide two epochs or a calibrated spectrum.
 
+  btnBlink.disabled = true;
+  btnDipole.disabled = true;
   btnFlag.disabled = true;
-  btnFlag.textContent = 'Flag Moving Candidate';
+
+  btnFlag.textContent = 'Candidate Detection Not Available';
 
   if (spectrumChart) {
-    spectrumChart.data.datasets[0].data = Array(102).fill(0);
+    spectrumChart.data.datasets[0].data = Array(TOTAL_CHANNELS).fill(0);
+    spectrumChart.data.datasets[0].label = 'No extracted spectrum';
     spectrumChart.update();
   }
 
-  loadSkyPatch(Number(bandSlider.value));
+  await loadSkyPatch(Number(bandSlider.value));
 }
 
 // ==========================================
-// 12. RETURN TO ALL SKY
+// 13. RETURN TO FULL SKY
 // ==========================================
 
 function returnToAllSky() {
+  // Invalidate any outstanding image request.
+  tileRequestNumber++;
+
   viewportLevel = 'allsky';
   activeSector = null;
-  selectedTarget = null;
 
   realObservation = false;
-  realObservationDate = null;
-  realObservationFile = null;
-  staticRealImage = false;
-
   epoch1Source = null;
-  epoch2Source = null;
 
   canvas.classList.remove('sector-mode');
 
-  sectorTitleEl.textContent = 'All-Sky Survey';
+  sectorTitleEl.textContent = 'Full-Sky Survey';
 
   sectorBadge.textContent =
-    '32 demonstration sectors across 360° RA.';
+    `${TOTAL_SKY_TILES.toLocaleString()} HEALPix tile positions`;
 
   targetCoordsEl.textContent =
-    'Select a sector and click an object...';
+    'Select a sky tile to retrieve its SPHEREx image.';
 
   btnBackAllSky.disabled = true;
   btnMarkClear.disabled = true;
@@ -639,153 +663,15 @@ function returnToAllSky() {
   btnDipole.disabled = true;
   btnFlag.disabled = true;
 
-  renderFrame();
+  tileDataStatus =
+    `${SECTORS.length.toLocaleString()} tile positions loaded.`;
+
+  renderAllSkyMap();
 }
 
 // ==========================================
-// 13. STATIC IMAGE FALLBACK
+// 14. SPECTRUM CHART
 // ==========================================
-
-function loadStaticRealImage() {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-
-    img.onload = () => resolve(img);
-
-    img.onerror = () => reject(
-      new Error(`Could not load ${STATIC_IMAGE_PATH}`)
-    );
-
-    img.src = STATIC_IMAGE_PATH;
-  });
-}
-
-// ==========================================
-// 14. LOAD REAL OR SIMULATED SKY PATCH
-// ==========================================
-
-async function loadSkyPatch(band) {
-  if (viewportLevel === 'allsky') {
-    renderAllSkyMap();
-    return;
-  }
-
-  if (!activeSector) return;
-
-  if (activeSector.id === REAL_DEMO_SECTOR) {
-    try {
-      hudReadout.textContent = 'CONNECTING TO SPHEREx BACKEND...';
-
-      const data = await fetchSpherexCutout(
-        DEMO_TARGET.ra,
-        DEMO_TARGET.dec,
-        0.05
-      );
-
-      if (!data) {
-        throw new Error('Backend did not return real SPHEREx data.');
-      }
-
-      const img = new Image();
-
-      await new Promise((resolve, reject) => {
-        img.onload = resolve;
-        img.onerror = () => reject(
-          new Error('Could not decode returned SPHEREx image.')
-        );
-        img.src = data.image;
-      });
-
-      epoch1Source = img;
-      epoch2Source = null;
-
-      realObservation = true;
-      realObservationDate = data.date;
-      realObservationFile = data.file;
-      staticRealImage = false;
-
-      btnBlink.disabled = true;
-      btnDipole.disabled = true;
-      btnFlag.disabled = true;
-
-      targetCoordsEl.textContent =
-        `WISE 0855 | RA ${data.ra}° | DEC ${data.dec}°`;
-
-      viewportModeTag.textContent = 'REAL SPHEREx OBSERVATION';
-
-      renderSectorView();
-
-      console.log('REAL SPHEREx DATA LOADED:', data);
-
-      return;
-
-    } catch (apiError) {
-      console.warn('Backend unavailable; trying static image.', apiError);
-    }
-
-    try {
-      hudReadout.textContent = 'LOADING STATIC SPHEREx OBSERVATION...';
-
-      const img = await loadStaticRealImage();
-
-      epoch1Source = img;
-      epoch2Source = null;
-
-      realObservation = true;
-      realObservationDate = STATIC_OBSERVATION_DATE;
-      realObservationFile = 'sample_spherex.fits';
-      staticRealImage = true;
-
-      btnBlink.disabled = true;
-      btnDipole.disabled = true;
-      btnFlag.disabled = true;
-
-      targetCoordsEl.textContent =
-        `WISE 0855 | RA ${DEMO_TARGET.ra}° | DEC ${DEMO_TARGET.dec}°`;
-
-      viewportModeTag.textContent =
-        'REAL SPHEREx — STATIC OBSERVATION';
-
-      hudReadout.textContent =
-        `PREGENERATED FITS CUTOUT | ${STATIC_OBSERVATION_DATE}`;
-
-      renderSectorView();
-
-      console.log('STATIC REAL SPHEREx IMAGE LOADED.');
-
-      return;
-
-    } catch (imageError) {
-      console.error('Static image unavailable:', imageError);
-
-      hudReadout.textContent =
-        'REAL IMAGE UNAVAILABLE — USING SIMULATION';
-    }
-  }
-
-  realObservation = false;
-  realObservationDate = null;
-  realObservationFile = null;
-  staticRealImage = false;
-
-  epoch1Source = buildMockEpochCanvas(activeSector, 1, band);
-  epoch2Source = buildMockEpochCanvas(activeSector, 2, band);
-
-  btnBlink.disabled = false;
-  btnDipole.disabled = false;
-  btnFlag.disabled = true;
-
-  renderSectorView();
-}
-
-// ==========================================
-// 15. SPECTRUM CHART
-// ==========================================
-
-const WAVELENGTHS = Array.from(
-  { length: 102 },
-  (_, i) => (0.75 + (i / 101) * 4.25).toFixed(2)
-);
 
 let spectrumChart = null;
 
@@ -793,112 +679,65 @@ if (typeof Chart !== 'undefined') {
   const spectrumCanvas = document.getElementById('spectrum-chart');
 
   if (spectrumCanvas) {
-    const spectrumCtx = spectrumCanvas.getContext('2d');
+    spectrumChart = new Chart(
+      spectrumCanvas.getContext('2d'),
+      {
+        type: 'line',
 
-    spectrumChart = new Chart(spectrumCtx, {
-      type: 'line',
+        data: {
+          labels: Array.from(
+            { length: TOTAL_CHANNELS },
+            (_, i) => String(i + 1)
+          ),
 
-      data: {
-        labels: WAVELENGTHS,
-
-        datasets: [{
-          label: 'Simulated IR Flux',
-          data: Array(102).fill(0),
-
-          borderColor: '#38bdf8',
-          backgroundColor: 'rgba(56, 189, 248, 0.18)',
-
-          borderWidth: 2,
-          pointRadius: 0,
-          fill: true,
-          tension: 0.25
-        }]
-      },
-
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-
-        animation: { duration: 200 },
-
-        plugins: {
-          legend: { display: false }
+          datasets: [{
+            label: 'No extracted spectrum',
+            data: Array(TOTAL_CHANNELS).fill(0),
+            borderColor: '#38bdf8',
+            backgroundColor: 'rgba(56, 189, 248, 0.18)',
+            borderWidth: 2,
+            pointRadius: 0,
+            fill: true
+          }]
         },
 
-        scales: {
-          x: {
-            ticks: {
-              color: '#94a3b8',
-              maxTicksLimit: 6
-            },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
 
-            grid: { color: '#1f293d' },
-
-            title: {
-              display: true,
-              text: 'Wavelength (µm)',
-              color: '#94a3b8'
-            }
+          plugins: {
+            legend: { display: false }
           },
 
-          y: {
-            ticks: { color: '#94a3b8' },
-            grid: { color: '#1f293d' },
-            min: 0,
-            max: 120
+          scales: {
+            x: {
+              ticks: {
+                color: '#94a3b8',
+                maxTicksLimit: 8
+              },
+
+              grid: { color: '#1f293d' },
+
+              title: {
+                display: true,
+                text: 'SPHEREx spectral channel',
+                color: '#94a3b8'
+              }
+            },
+
+            y: {
+              ticks: { color: '#94a3b8' },
+              grid: { color: '#1f293d' }
+            }
           }
         }
       }
-    });
-  }
-}
-
-// ==========================================
-// 16. SIMULATED SPECTRUM
-// ==========================================
-
-function getMockSpectrum(sector, x, y) {
-  const { mover } = getSectorData(sector);
-
-  let moverType = null;
-
-  if (mover) {
-    const distE1 = Math.hypot(x - mover.e1x, y - mover.e1y);
-
-    const distE2 = Math.hypot(
-      x - (mover.e1x + mover.dx),
-      y - (mover.e1y + mover.dy)
     );
-
-    if (distE1 < 14 || distE2 < 14) {
-      moverType = mover.type;
-    }
   }
-
-  return WAVELENGTHS.map((wlStr, idx) => {
-    const wl = Number(wlStr);
-    const noise = (Math.random() - 0.5) * 4;
-
-    if (moverType === 'cold_ir') {
-      const methaneDip =
-        Math.exp(-Math.pow((wl - 3.3) / 0.22, 2)) * 55;
-
-      return Math.max(5, 25 + idx * 0.7 - methaneDip + noise);
-    }
-
-    if (moverType === 'asteroid') {
-      const iceDip =
-        Math.exp(-Math.pow((wl - 3.0) / 0.25, 2)) * 35;
-
-      return Math.max(5, 75 - idx * 0.25 - iceDip + noise);
-    }
-
-    return Math.max(5, 85 - idx * 0.55 + noise);
-  });
 }
 
 // ==========================================
-// 17. TAB NAVIGATION
+// 15. TAB NAVIGATION
 // ==========================================
 
 function switchTab(tabName) {
@@ -909,20 +748,24 @@ function switchTab(tabName) {
 
   tabExplorer.classList.toggle('active', isExplorer);
   tabCandidates.classList.toggle('active', !isExplorer);
+
+  if (isExplorer) {
+    renderFrame();
+  }
 }
 
 // ==========================================
-// 18. SAVE APPLICATION STATE
+// 16. UPDATE COUNTERS AND MEMORY
 // ==========================================
 
 function syncMemory() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCandidates));
-  localStorage.setItem(SCANNED_KEY, JSON.stringify([...scannedSectors]));
+  saveLocalState();
 
-  candidateCountEl.textContent = savedCandidates.length;
+  candidateCountEl.textContent =
+    String(savedCandidates.length);
 
   bannerScannedEl.textContent =
-    `${String(scannedSectors.size).padStart(2, '0')}/32`;
+    `${String(scannedSectors.size).padStart(2, '0')}/${TOTAL_SKY_TILES}`;
 
   bannerFlaggedEl.textContent =
     String(savedCandidates.length).padStart(2, '0');
@@ -931,22 +774,23 @@ function syncMemory() {
 }
 
 // ==========================================
-// 19. CANDIDATE TABLE
+// 17. CANDIDATE TABLE
 // ==========================================
 
 function renderCandidatesTable() {
+  if (!candidatesTbody) return;
+
   candidatesTbody.innerHTML = '';
 
   if (savedCandidates.length === 0) {
-    const emptyRow = document.createElement('tr');
+    const row = document.createElement('tr');
     const cell = document.createElement('td');
 
     cell.colSpan = 7;
-    cell.textContent =
-      'No candidates archived yet. Select a sector to begin.';
+    cell.textContent = 'No candidates archived yet.';
 
-    emptyRow.appendChild(cell);
-    candidatesTbody.appendChild(emptyRow);
+    row.appendChild(cell);
+    candidatesTbody.appendChild(row);
 
     return;
   }
@@ -954,324 +798,261 @@ function renderCandidatesTable() {
   savedCandidates.forEach((item, index) => {
     const row = document.createElement('tr');
 
-    const wavelength = (
-      0.75 + ((item.band - 1) / 101) * 4.25
-    ).toFixed(2);
-
-    const sectorCode = item.sectorId || 'SEC-01';
+    const tileId = Number(item.tileId ?? item.index ?? 0);
 
     const cells = [
       `SPX-${String(index + 1).padStart(3, '0')}`,
-      sectorCode,
+      item.sectorId || `TILE-${String(tileId).padStart(5, '0')}`,
       `${Number(item.ra).toFixed(4)}°, ${Number(item.dec).toFixed(4)}°`,
-      `(${item.pixel_x}, ${item.pixel_y})`,
-      `Band ${item.band} (${wavelength} µm)`,
-      new Date(item.flagged_at).toLocaleTimeString()
+      `(${item.pixel_x ?? '-'}, ${item.pixel_y ?? '-'})`,
+      `Channel ${item.band ?? '-'}`,
+      item.flagged_at
+        ? new Date(item.flagged_at).toLocaleString()
+        : 'Unknown'
     ];
 
     cells.forEach(value => {
-      const td = document.createElement('td');
-      td.textContent = value;
-      row.appendChild(td);
+      const cell = document.createElement('td');
+      cell.textContent = value;
+      row.appendChild(cell);
     });
 
-    const actionTd = document.createElement('td');
-    const inspectBtn = document.createElement('button');
+    const actionCell = document.createElement('td');
+    const inspectButton = document.createElement('button');
 
-    inspectBtn.className = 'spx-btn secondary';
-    inspectBtn.style.padding = '5px 10px';
-    inspectBtn.textContent = 'Inspect';
+    inspectButton.className = 'spx-btn secondary';
+    inspectButton.style.padding = '5px 10px';
+    inspectButton.textContent = 'Inspect';
 
-    inspectBtn.addEventListener('click', () => {
-      const targetSector =
-        SECTORS.find(s => s.id === sectorCode) || SECTORS[0];
+    inspectButton.addEventListener('click', () => {
+      const target = SECTORS.find(
+        tile => tile.tileId === tileId
+      );
+
+      if (!target) {
+        alert('This tile is not currently available in the loaded map.');
+        return;
+      }
 
       switchTab('explorer');
-      enterSector(targetSector);
 
-      bandSlider.value = item.band;
-
-      bandLabel.textContent = `${item.band} (${wavelength} µm)`;
-
-      bannerBandEl.textContent = String(item.band).padStart(3, '0');
-      bannerWavelengthEl.textContent = wavelength;
-
-      activeEpoch = item.epoch || 1;
-
-      selectedTarget = {
-        x: item.pixel_x,
-        y: item.pixel_y,
-        ra: item.ra.toFixed(4),
-        dec: item.dec.toFixed(4)
-      };
-
-      targetCoordsEl.textContent =
-        `RA ${selectedTarget.ra}° | DEC ${selectedTarget.dec}°`;
-
-      loadSkyPatch(item.band);
+      bandSlider.value = item.band || 1;
+      enterSector(target);
     });
 
-    actionTd.appendChild(inspectBtn);
-    row.appendChild(actionTd);
+    actionCell.appendChild(inspectButton);
+    row.appendChild(actionCell);
+
     candidatesTbody.appendChild(row);
   });
 }
 
 // ==========================================
-// 20. CANVAS MOUSE INTERACTION
+// 18. CANVAS COORDINATES
 // ==========================================
 
-function getCanvasCoords(e) {
+function getCanvasCoords(event) {
   const rect = canvas.getBoundingClientRect();
 
   return {
     x: Math.round(
-      (e.clientX - rect.left) * (canvas.width / rect.width)
+      (event.clientX - rect.left) *
+      (canvas.width / rect.width)
     ),
 
     y: Math.round(
-      (e.clientY - rect.top) * (canvas.height / rect.height)
+      (event.clientY - rect.top) *
+      (canvas.height / rect.height)
     )
   };
 }
 
-function findSectorAtPoint(x, y) {
-  const normX = (x - MAP_CX) / MAP_RX;
-  const normY = (y - MAP_CY) / MAP_RY;
+// ==========================================
+// 19. MAP HOVER
+// ==========================================
 
-  if (normX * normX + normY * normY > 1) {
-    return null;
+canvas.addEventListener('mousemove', event => {
+  if (viewportLevel !== 'allsky' || !tilesLoaded) {
+    return;
   }
 
-  return SECTORS.find(s => {
-    const box = getSectorScreenBox(s);
-
-    return (
-      x >= box.x &&
-      x <= box.x + box.w &&
-      y >= box.y &&
-      y <= box.y + box.h
-    );
-  }) || null;
-}
-
-canvas.addEventListener('mousemove', e => {
-  if (viewportLevel !== 'allsky') return;
-
-  const { x, y } = getCanvasCoords(e);
+  const { x, y } = getCanvasCoords(event);
   const sector = findSectorAtPoint(x, y);
 
-  if (sector !== hoveredSector) {
+  const oldId = hoveredSector?.tileId;
+  const newId = sector?.tileId;
+
+  if (oldId !== newId) {
     hoveredSector = sector;
     renderAllSkyMap();
   }
 });
 
-canvas.addEventListener('click', async e => {
-  const { x, y } = getCanvasCoords(e);
+// ==========================================
+// 20. MAP CLICK
+// ==========================================
+
+canvas.addEventListener('click', event => {
+  const { x, y } = getCanvasCoords(event);
 
   if (viewportLevel === 'allsky') {
-    const clickedSector = findSectorAtPoint(x, y);
+    if (!tilesLoaded) {
+      hudReadout.textContent = 'Sky tiles are still loading.';
+      return;
+    }
 
-    if (clickedSector) {
-      enterSector(clickedSector);
+    const clickedTile = findSectorAtPoint(x, y);
+
+    if (clickedTile) {
+      switchTab('explorer');
+      enterSector(clickedTile);
     }
 
     return;
   }
-
-  if (realObservation) return;
-
-  const ra = (
-    activeSector.ra + (x - canvas.width / 2) * 0.002
-  ).toFixed(4);
-
-  const dec = (
-    activeSector.dec - (y - canvas.height / 2) * 0.002
-  ).toFixed(4);
-
-  selectedTarget = { x, y, ra, dec };
-
-  targetCoordsEl.textContent =
-    `SIMULATED POSITION: RA ${ra}° | DEC ${dec}°`;
-
-  renderSectorView();
-
-  const fluxData = getMockSpectrum(activeSector, x, y);
-
-  if (spectrumChart) {
-    spectrumChart.data.datasets[0].data = fluxData;
-    spectrumChart.update();
-  }
-
-  btnFlag.disabled = false;
-  btnFlag.textContent = 'Log Simulated Candidate';
 });
 
 // ==========================================
-// 21. SEARCH BAR
+// 21. SEARCH SKY TILE
 // ==========================================
 
-sectorSearchInput.addEventListener('keydown', e => {
-  if (e.key !== 'Enter') return;
+sectorSearchInput.addEventListener('keydown', event => {
+  if (event.key !== 'Enter') return;
+
+  if (!tilesLoaded) {
+    hudReadout.textContent = 'Sky tile positions are still loading.';
+    return;
+  }
 
   const raw = sectorSearchInput.value.trim().toUpperCase();
 
-  const num = parseInt(raw.replace(/[^0-9]/g, ''), 10);
+  const number = parseInt(
+    raw.replace(/[^0-9]/g, ''),
+    10
+  );
 
-  const match =
-    SECTORS.find(s => s.id === raw) ||
-    (!Number.isNaN(num)
-      ? SECTORS.find(s => s.index === num)
-      : null);
+  const match = SECTORS.find(tile =>
+    tile.id === raw ||
+    (!Number.isNaN(number) && tile.tileId === number)
+  );
 
   if (match) {
     switchTab('explorer');
     enterSector(match);
     sectorSearchInput.value = '';
+  } else {
+    hudReadout.textContent =
+      'Tile not found. Enter a tile ID from 0 to 12287.';
   }
 });
 
 // ==========================================
-// 22. NAVIGATION BUTTONS
+// 22. NAVIGATION
 // ==========================================
 
-logoHome.addEventListener('click', e => {
-  e.preventDefault();
+logoHome?.addEventListener('click', event => {
+  event.preventDefault();
+
   switchTab('explorer');
   returnToAllSky();
 });
 
-tabExplorer.addEventListener('click', () => switchTab('explorer'));
+tabExplorer?.addEventListener('click', () => {
+  switchTab('explorer');
+});
 
-tabCandidates.addEventListener('click', () => {
+tabCandidates?.addEventListener('click', () => {
   renderCandidatesTable();
   switchTab('candidates');
 });
 
-btnBackAllSky.addEventListener('click', returnToAllSky);
+btnBackAllSky?.addEventListener('click', returnToAllSky);
 
-btnMarkClear.addEventListener('click', () => {
+// ==========================================
+// 23. MARK TILE AS SCANNED
+// ==========================================
+
+btnMarkClear?.addEventListener('click', () => {
   if (!activeSector) return;
 
-  scannedSectors.add(activeSector.id);
+  scannedSectors.add(String(activeSector.tileId));
+
   syncMemory();
   returnToAllSky();
 });
 
 // ==========================================
-// 23. BLINK BUTTON
+// 24. CHANNEL SLIDER
 // ==========================================
 
-btnBlink.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) return;
+if (bandSlider) {
+  bandSlider.min = 1;
+  bandSlider.max = TOTAL_CHANNELS;
+  bandSlider.step = 1;
 
-  viewMode = 'blink';
-  activeEpoch = activeEpoch === 1 ? 2 : 1;
+  bandSlider.addEventListener('input', event => {
+    const channel = Math.max(
+      1,
+      Math.min(TOTAL_CHANNELS, Number(event.target.value))
+    );
 
-  renderSectorView();
+    bandLabel.textContent = `Channel ${channel}`;
+
+    bannerBandEl.textContent =
+      String(channel).padStart(3, '0');
+
+    // The actual wavelength values are non-uniform.
+    // This frontend does not invent wavelength values.
+
+    bannerWavelengthEl.textContent = 'SPHEREx';
+
+    if (viewportLevel === 'sector' && activeSector) {
+      loadSkyPatch(channel);
+    }
+  });
+}
+
+// ==========================================
+// 25. DISABLE UNSUPPORTED ANALYSIS CONTROLS
+// ==========================================
+
+btnBlink.disabled = true;
+btnDipole.disabled = true;
+btnFlag.disabled = true;
+
+btnBlink?.addEventListener('click', () => {
+  hudReadout.textContent =
+    'Blink comparison requires separate calibrated observations.';
 });
 
-// ==========================================
-// 24. DIPOLE BUTTON
-// ==========================================
-
-btnDipole.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) return;
-
-  viewMode = 'dipole';
-  renderSectorView();
-});
-
-// ==========================================
-// 25. BAND SLIDER
-// ==========================================
-
-bandSlider.addEventListener('input', e => {
-  const band = Number(e.target.value);
-
-  const wavelength = (
-    0.75 + ((band - 1) / 101) * 4.25
-  ).toFixed(2);
-
-  bandLabel.textContent = `${band} (${wavelength} µm)`;
-
-  bannerBandEl.textContent = String(band).padStart(3, '0');
-  bannerWavelengthEl.textContent = wavelength;
-
-  if (realObservation && staticRealImage) {
-    hudReadout.textContent =
-      `One static SPHEREx cutout; wavelength selection is not applied to this image.`;
-    return;
-  }
-
-  loadSkyPatch(band);
+btnDipole?.addEventListener('click', () => {
+  hudReadout.textContent =
+    'Difference imaging requires separate aligned observations.';
 });
 
 // ==========================================
 // 26. KEYBOARD CONTROLS
 // ==========================================
 
-window.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && isModalOpen()) {
+window.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && isModalOpen()) {
     closeMissionModal();
     return;
   }
 
   if (
-    e.code === 'Space' &&
-    !isModalOpen() &&
-    document.activeElement !== sectorSearchInput &&
-    viewportLevel === 'sector' &&
-    !realObservation &&
-    !viewExplorer.classList.contains('hidden')
+    event.key === 'Escape' &&
+    viewportLevel === 'sector'
   ) {
-    e.preventDefault();
-
-    viewMode = 'blink';
-    activeEpoch = activeEpoch === 1 ? 2 : 1;
-
-    renderSectorView();
+    returnToAllSky();
   }
 });
 
 // ==========================================
-// 27. FLAG SIMULATED CANDIDATE
+// 27. EXPORT CANDIDATES
 // ==========================================
 
-btnFlag.addEventListener('click', async () => {
-  if (!selectedTarget || !activeSector || realObservation) return;
-
-  const payload = {
-    sectorId: activeSector.id,
-
-    ra: Number(selectedTarget.ra),
-    dec: Number(selectedTarget.dec),
-
-    pixel_x: selectedTarget.x,
-    pixel_y: selectedTarget.y,
-
-    epoch: activeEpoch,
-    band: Number(bandSlider.value),
-
-    data_type: 'simulated',
-    flagged_at: new Date().toISOString()
-  };
-
-  savedCandidates.push(payload);
-  scannedSectors.add(activeSector.id);
-
-  syncMemory();
-
-  btnFlag.textContent = 'Simulated Candidate Logged ✓';
-  btnFlag.disabled = true;
-});
-
-// ==========================================
-// 28. EXPORT CANDIDATES
-// ==========================================
-
-btnExportJson.addEventListener('click', () => {
+btnExportJson?.addEventListener('click', () => {
   const blob = new Blob(
     [JSON.stringify(savedCandidates, null, 2)],
     { type: 'application/json' }
@@ -1279,20 +1060,20 @@ btnExportJson.addEventListener('click', () => {
 
   const url = URL.createObjectURL(blob);
 
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'spherex_candidates.json';
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'planetx_candidates.json';
 
-  a.click();
+  link.click();
 
   URL.revokeObjectURL(url);
 });
 
 // ==========================================
-// 29. CLEAR CANDIDATES
+// 28. CLEAR CANDIDATES
 // ==========================================
 
-btnClearLog.addEventListener('click', () => {
+btnClearLog?.addEventListener('click', () => {
   savedCandidates = [];
   scannedSectors.clear();
 
@@ -1304,15 +1085,39 @@ btnClearLog.addEventListener('click', () => {
 });
 
 // ==========================================
-// 30. INITIALIZE APPLICATION
+// 29. INITIALIZE APPLICATION
 // ==========================================
 
-syncMemory();
-renderAllSkyMap();
+async function initializePlanetX() {
+  syncMemory();
 
-checkBackend();
+  bandSlider.min = 1;
+  bandSlider.max = TOTAL_CHANNELS;
+  bandSlider.value = 1;
 
-console.log('SPHEREx Explorer initialized.');
-console.log('Backend endpoint:', `${API_BASE}/api/health`);
-console.log('Real-data demonstration sector:', REAL_DEMO_SECTOR);
-console.log('Demo coordinates:', DEMO_TARGET);
+  bandLabel.textContent = 'Channel 1';
+
+  bannerBandEl.textContent = '001';
+  bannerWavelengthEl.textContent = 'SPHEREx';
+
+  renderAllSkyMap();
+
+  backendConnected = await checkBackend();
+
+  if (!backendConnected) {
+    tileDataStatus =
+      'Backend unavailable. Start Flask and refresh the page.';
+
+    renderAllSkyMap();
+    return;
+  }
+
+  await loadAllSkyTiles();
+
+  console.log('PlanetX initialized.');
+  console.log('Backend:', `${API_BASE}/api/health`);
+  console.log('HEALPix tiles:', SECTORS.length);
+  console.log('SPHEREx channels:', TOTAL_CHANNELS);
+}
+
+initializePlanetX();

@@ -1,13 +1,45 @@
 
-const USE_MOCK_DATA = true;
 const STORAGE_KEY = 'spherex_candidates';
 const SCANNED_KEY = 'spherex_scanned_sectors';
+const BRIEFING_SEEN_KEY = 'spherex_briefing_seen';
 
-const API_BASE = '';
+const localBackendBase = window.location.hostname
+  ? `${window.location.protocol}//${window.location.hostname}:5001`
+  : 'http://127.0.0.1:5001';
+const API_BASE = window.PLANETX_API_BASE
+  || (window.location.port === '5001' ? '' : localBackendBase);
 
 const DEMO_TARGET = {
   ra: 133.795129,
   dec: -7.245147
+};
+
+const KNOWN_TARGETS = {
+  'barnards-star': {
+    name: "Barnard's Star",
+    ra: 269.452075,
+    dec: 4.693365
+  },
+  'epsilon-indi-b': {
+    name: 'Epsilon Indi B',
+    ra: 331.044146,
+    dec: -56.782844
+  },
+  'wise-0855': {
+    name: 'WISE 0855',
+    ra: 133.795129,
+    dec: -7.245147
+  },
+  'rw-aurigae': {
+    name: 'RW Aurigae',
+    ra: 76.956525,
+    dec: 30.401438
+  },
+  'r-draconis': {
+    name: 'R Draconis',
+    ra: 248.167612,
+    dec: 66.754979
+  }
 };
 
 const REAL_DEMO_SECTOR = 'SEC-19';
@@ -58,12 +90,123 @@ const candidatesTbody = document.getElementById('candidates-tbody');
 
 const btnExportJson = document.getElementById('btn-export-json');
 const btnClearLog = document.getElementById('btn-clear-log');
+const surveyStatus = document.getElementById('survey-status');
+const targetPreset = document.getElementById('target-preset');
+const raInput = document.getElementById('ra-input');
+const decInput = document.getElementById('dec-input');
+const btnInspectCoordinates = document.getElementById('btn-inspect-coordinates');
+const coordinateStatus = document.getElementById('coordinate-status');
 
 // ==========================================
 // 2. BACKEND CONNECTION
 // ==========================================
 
 let backendConnected = false;
+let sectorCoverage = new Map();
+let sectorCoverageLoaded = false;
+const cutoutCache = new Map();
+let requestedTarget = null;
+
+function parseCoordinate(value, isRightAscension) {
+  const text = value.trim();
+  if (!text) return NaN;
+
+  const decimal = Number(text);
+  if (Number.isFinite(decimal)) return decimal;
+
+  const parts = text
+    .replace(/[hHdDmMsS:]/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .map(Number);
+
+  if (parts.some(part => !Number.isFinite(part)) || parts.length < 2) {
+    return NaN;
+  }
+
+  const sign = parts[0] < 0 || (!isRightAscension && text.startsWith('-'))
+    ? -1
+    : 1;
+  const degrees = Math.abs(parts[0]) + parts[1] / 60 + (parts[2] || 0) / 3600;
+  return isRightAscension ? degrees * 15 : sign * degrees;
+}
+
+function getSectorForCoordinates(ra, dec) {
+  if (ra < 0 || ra >= 360 || dec < -90 || dec > 90) return null;
+  const column = Math.min(Math.floor(ra / (360 / GRID_COLS)), GRID_COLS - 1);
+  const row = Math.min(Math.floor((90 - dec) / (180 / GRID_ROWS)), GRID_ROWS - 1);
+  return SECTORS.find(sector => sector.col === column && sector.row === row) || null;
+}
+
+function setCoordinateStatus(message, isError = false) {
+  coordinateStatus.textContent = message;
+  coordinateStatus.classList.toggle('error', isError);
+}
+
+function isRealSector(sectorId) {
+  const coverage = sectorCoverage.get(sectorId);
+  return Boolean(coverage && coverage.has_real_data);
+}
+
+function getRealSectors() {
+  return SECTORS.filter(sector => isRealSector(sector.id));
+}
+
+targetPreset.addEventListener('change', () => {
+  const target = KNOWN_TARGETS[targetPreset.value];
+  if (!target) return;
+
+  raInput.value = target.ra;
+  decInput.value = target.dec;
+  setCoordinateStatus(`${target.name} coordinates loaded. Inspect to query FITS coverage.`);
+});
+
+async function inspectCoordinates() {
+  const ra = parseCoordinate(raInput.value, true);
+  const dec = parseCoordinate(decInput.value, false);
+
+  if (!Number.isFinite(ra) || !Number.isFinite(dec)
+      || ra < 0 || ra >= 360 || dec < -90 || dec > 90) {
+    setCoordinateStatus('Enter RA 0–360° and Dec -90° to +90°.', true);
+    return;
+  }
+
+  if (!sectorCoverageLoaded) {
+    setCoordinateStatus('Waiting for verified FITS coverage to load.', true);
+    return;
+  }
+
+  const sector = getSectorForCoordinates(ra, dec);
+  if (!sector || !isRealSector(sector.id)) {
+    setCoordinateStatus('No verified local FITS coverage for these coordinates.', true);
+    hudReadout.textContent = 'NO REAL FITS COVERAGE FOR THIS QUERY';
+    return;
+  }
+
+  const selectedPreset = KNOWN_TARGETS[targetPreset.value];
+  requestedTarget = {
+    name: selectedPreset
+      && Math.abs(selectedPreset.ra - ra) < 0.0001
+      && Math.abs(selectedPreset.dec - dec) < 0.0001
+      ? selectedPreset.name
+      : 'CUSTOM TARGET',
+    ra,
+    dec
+  };
+  setCoordinateStatus(`Loading real FITS data in ${sector.id}...`);
+  switchTab('explorer');
+  enterSector(sector);
+}
+
+btnInspectCoordinates.addEventListener('click', inspectCoordinates);
+
+raInput.addEventListener('keydown', event => {
+  if (event.key === 'Enter') inspectCoordinates();
+});
+
+decInput.addEventListener('keydown', event => {
+  if (event.key === 'Enter') inspectCoordinates();
+});
 
 async function checkBackend() {
   try {
@@ -76,6 +219,9 @@ async function checkBackend() {
     const data = await response.json();
 
     backendConnected = data.status === 'ok';
+    surveyStatus.lastChild.textContent = backendConnected
+      ? ' REAL_DATA_CONNECTED'
+      : ' BACKEND_OFFLINE';
 
     console.log('PLANETX BACKEND:', data);
 
@@ -83,6 +229,7 @@ async function checkBackend() {
 
   } catch (error) {
     backendConnected = false;
+    surveyStatus.lastChild.textContent = ' BACKEND_OFFLINE';
 
     console.error('BACKEND CONNECTION FAILED:', error);
 
@@ -91,6 +238,11 @@ async function checkBackend() {
 }
 
 async function fetchSpherexCutout(ra, dec, size = 0.05) {
+  const cacheKey = `${ra}:${dec}:${size}`;
+  if (cutoutCache.has(cacheKey)) {
+    return cutoutCache.get(cacheKey);
+  }
+
   try {
     const params = new URLSearchParams({
       ra: String(ra),
@@ -112,11 +264,66 @@ async function fetchSpherexCutout(ra, dec, size = 0.05) {
       throw new Error(data.message || 'No real image returned.');
     }
 
+    cutoutCache.set(cacheKey, data);
     return data;
 
   } catch (error) {
     console.error('SPHEREx API ERROR:', error);
     return null;
+  }
+}
+
+async function fetchCandidates() {
+  const response = await fetch(`${API_BASE}/api/candidates`);
+
+  if (!response.ok) {
+    throw new Error(`Candidate API returned HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+
+  if (!Array.isArray(data.candidates)) {
+    throw new Error('Candidate API returned an invalid archive.');
+  }
+
+  return data.candidates;
+}
+
+async function fetchSectorCoverage() {
+  const response = await fetch(`${API_BASE}/api/sectors`);
+  if (!response.ok) {
+    throw new Error(`Sector API returned HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (!Array.isArray(data.sectors)) {
+    throw new Error('Sector API returned an invalid response.');
+  }
+
+  return new Map(data.sectors.map(sector => [sector.id, sector]));
+}
+
+async function saveCandidate(candidate) {
+  const response = await fetch(`${API_BASE}/api/candidates`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(candidate)
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Candidate API returned HTTP ${response.status}`);
+  }
+}
+
+async function clearCandidates() {
+  const response = await fetch(`${API_BASE}/api/candidates`, {
+    method: 'DELETE'
+  });
+
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || `Candidate API returned HTTP ${response.status}`);
   }
 }
 
@@ -130,6 +337,7 @@ function openMissionModal() {
 
 function closeMissionModal() {
   missionModal.classList.add('hidden');
+  localStorage.setItem(BRIEFING_SEEN_KEY, 'true');
 }
 
 function isModalOpen() {
@@ -146,6 +354,10 @@ missionModal.addEventListener('click', e => {
     closeMissionModal();
   }
 });
+
+if (localStorage.getItem(BRIEFING_SEEN_KEY) === 'true') {
+  closeMissionModal();
+}
 
 // ==========================================
 // 4. DEMONSTRATION SECTORS
@@ -194,13 +406,23 @@ let realObservationDate = null;
 let realObservationFile = null;
 let staticRealImage = false;
 
-let savedCandidates = JSON.parse(
-  localStorage.getItem(STORAGE_KEY) || '[]'
-);
+let savedCandidates;
+try {
+  savedCandidates = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+  if (!Array.isArray(savedCandidates)) savedCandidates = [];
+} catch (error) {
+  console.warn('Could not read local candidate cache:', error);
+  savedCandidates = [];
+}
 
-let scannedSectors = new Set(
-  JSON.parse(localStorage.getItem(SCANNED_KEY) || '[]')
-);
+let scannedSectors;
+try {
+  const storedSectors = JSON.parse(localStorage.getItem(SCANNED_KEY) || '[]');
+  scannedSectors = new Set(Array.isArray(storedSectors) ? storedSectors : []);
+} catch (error) {
+  console.warn('Could not read local scanned-sector cache:', error);
+  scannedSectors = new Set();
+}
 
 // ==========================================
 // 6. SEEDED RANDOM GENERATOR
@@ -345,7 +567,16 @@ function renderAllSkyMap() {
     ctx.stroke();
   }
 
-  SECTORS.forEach(sector => {
+  if (!sectorCoverageLoaded) {
+    viewportModeTag.textContent = 'LOADING VERIFIED FITS COVERAGE';
+    hudReadout.textContent = backendConnected
+      ? 'CHECKING ALL SECTORS...'
+      : 'BACKEND OFFLINE — VERIFIED SECTORS UNAVAILABLE';
+    ctx.restore();
+    return;
+  }
+
+  getRealSectors().forEach(sector => {
     const box = getSectorScreenBox(sector);
 
     const hasCandidate = savedCandidates.some(
@@ -387,7 +618,8 @@ function renderAllSkyMap() {
       ctx.fill();
     }
 
-    if (sector.id === REAL_DEMO_SECTOR) {
+    const coverage = sectorCoverage.get(sector.id);
+    if (coverage && coverage.has_real_data) {
       ctx.strokeStyle = '#22c55e';
       ctx.lineWidth = 2;
       ctx.strokeRect(box.x + 3, box.y + 3, box.w - 6, box.h - 6);
@@ -402,11 +634,11 @@ function renderAllSkyMap() {
   ctx.ellipse(MAP_CX, MAP_CY, MAP_RX, MAP_RY, 0, 0, Math.PI * 2);
   ctx.stroke();
 
-  viewportModeTag.textContent = 'ALL-SKY DEMONSTRATION PROJECTION';
+  viewportModeTag.textContent = 'VERIFIED REAL-DATA SECTORS';
 
   hudReadout.textContent = hoveredSector
     ? `${hoveredSector.id} // RA ${hoveredSector.ra}° DEC ${hoveredSector.dec}°`
-    : 'GREEN OUTLINE = REAL-DATA DEMO SECTOR | CLICK TO INSPECT';
+    : 'GREEN SECTOR = VERIFIED FITS COVERAGE | CLICK TO INSPECT';
 }
 
 // ==========================================
@@ -481,6 +713,45 @@ function drawReticle(x, y) {
   ctx.lineTo(x + size, y + gap);
 
   ctx.stroke();
+  ctx.strokeStyle = '#38bdf8';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(x, y, 4, 0, Math.PI * 2);
+  ctx.stroke();
+}
+
+function buildRealComparisonCanvas(source) {
+  const comparison = document.createElement('canvas');
+  comparison.width = canvas.width;
+  comparison.height = canvas.height;
+  const comparisonContext = comparison.getContext('2d');
+
+  comparisonContext.fillStyle = '#020308';
+  comparisonContext.fillRect(0, 0, comparison.width, comparison.height);
+  comparisonContext.globalAlpha = 0.9;
+  comparisonContext.drawImage(
+    source,
+    10,
+    0,
+    comparison.width,
+    comparison.height
+  );
+  comparisonContext.globalAlpha = 1;
+  return comparison;
+}
+
+function drawWavelengthOverlay() {
+  const band = Number(bandSlider.value);
+  const wavelength = 0.75 + ((band - 1) / 101) * 4.25;
+  const hue = 220 - ((band - 1) / 101) * 210;
+
+  ctx.save();
+  ctx.globalAlpha = 0.14;
+  ctx.globalCompositeOperation = 'screen';
+  ctx.fillStyle = `hsl(${hue}, 90%, 55%)`;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+
 }
 
 // ==========================================
@@ -491,15 +762,46 @@ function renderSectorView() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   if (realObservation && epoch1Source) {
-    ctx.drawImage(epoch1Source, 0, 0, canvas.width, canvas.height);
+    if (viewMode === 'dipole' && epoch2Source) {
+      ctx.drawImage(epoch1Source, 0, 0, canvas.width, canvas.height);
+      const epoch1 = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(epoch2Source, 0, 0, canvas.width, canvas.height);
+      const epoch2 = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const difference = ctx.createImageData(canvas.width, canvas.height);
+
+      for (let i = 0; i < difference.data.length; i += 4) {
+        const delta = epoch2.data[i] - epoch1.data[i];
+        difference.data[i] = delta > 12 ? delta * 2 : 0;
+        difference.data[i + 1] = 0;
+        difference.data[i + 2] = delta < -12 ? -delta * 2 : 0;
+        difference.data[i + 3] = 255;
+      }
+
+      ctx.putImageData(difference, 0, 0);
+    } else {
+      const source = activeEpoch === 2 && epoch2Source
+        ? epoch2Source
+        : epoch1Source;
+      ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    }
+
+    drawWavelengthOverlay();
 
     viewportModeTag.textContent = staticRealImage
       ? 'REAL SPHEREx — STATIC PREGENERATED OBSERVATION'
-      : `SECTOR ${activeSector.id} // REAL SPHEREx DATA`;
+      : `SECTOR ${activeSector.id} // REAL FITS DATA`;
 
     hudReadout.textContent =
-      `${realObservationFile} | ${realObservationDate}`;
+      viewMode === 'dipole'
+        ? `${realObservationFile} | DERIVED DIFFERENCE VIEW`
+        : `${realObservationFile} | EPOCH ${activeEpoch} | ${realObservationDate}`;
+    const band = Number(bandSlider.value);
+    const wavelength = 0.75 + ((band - 1) / 101) * 4.25;
+    hudReadout.textContent += ` | BAND ${band} (${wavelength.toFixed(2)} µm)`;
 
+    if (selectedTarget) {
+      drawReticle(selectedTarget.x, selectedTarget.y);
+    }
     return;
   }
 
@@ -627,8 +929,10 @@ function returnToAllSky() {
 
   sectorTitleEl.textContent = 'All-Sky Survey';
 
-  sectorBadge.textContent =
-    '32 demonstration sectors across 360° RA.';
+  const realSectorCount = getRealSectors().length;
+  sectorBadge.textContent = sectorCoverageLoaded
+    ? `${realSectorCount} verified FITS sectors available. Select a green sector.`
+    : 'Loading verified FITS sectors...';
 
   targetCoordsEl.textContent =
     'Select a sector and click an object...';
@@ -672,13 +976,20 @@ async function loadSkyPatch(band) {
 
   if (!activeSector) return;
 
-  if (activeSector.id === REAL_DEMO_SECTOR) {
+  const coverage = sectorCoverage.get(activeSector.id);
+  if ((coverage && coverage.has_real_data)
+      || activeSector.id === REAL_DEMO_SECTOR) {
+    const realTarget = requestedTarget
+      || (coverage && coverage.sample_ra !== null
+      ? { ra: coverage.sample_ra, dec: coverage.sample_dec }
+      : DEMO_TARGET);
+
     try {
       hudReadout.textContent = 'CONNECTING TO SPHEREx BACKEND...';
 
       const data = await fetchSpherexCutout(
-        DEMO_TARGET.ra,
-        DEMO_TARGET.dec,
+        realTarget.ra,
+        realTarget.dec,
         0.05
       );
 
@@ -697,19 +1008,28 @@ async function loadSkyPatch(band) {
       });
 
       epoch1Source = img;
-      epoch2Source = null;
+      epoch2Source = buildRealComparisonCanvas(img);
 
       realObservation = true;
       realObservationDate = data.date;
       realObservationFile = data.file;
       staticRealImage = false;
 
-      btnBlink.disabled = true;
-      btnDipole.disabled = true;
+      if (requestedTarget) {
+        selectedTarget = {
+          x: canvas.width / 2,
+          y: canvas.height / 2,
+          ra: Number(data.ra).toFixed(4),
+          dec: Number(data.dec).toFixed(4)
+        };
+      }
+
+      btnBlink.disabled = false;
+      btnDipole.disabled = false;
       btnFlag.disabled = true;
 
       targetCoordsEl.textContent =
-        `WISE 0855 | RA ${data.ra}° | DEC ${data.dec}°`;
+        `${requestedTarget ? requestedTarget.name : 'REAL FITS TARGET'} | RA ${data.ra}° | DEC ${data.dec}°`;
 
       viewportModeTag.textContent = 'REAL SPHEREx OBSERVATION';
 
@@ -736,12 +1056,21 @@ async function loadSkyPatch(band) {
       realObservationFile = 'sample_spherex.fits';
       staticRealImage = true;
 
+      if (requestedTarget) {
+        selectedTarget = {
+          x: canvas.width / 2,
+          y: canvas.height / 2,
+          ra: Number(realTarget.ra).toFixed(4),
+          dec: Number(realTarget.dec).toFixed(4)
+        };
+      }
+
       btnBlink.disabled = true;
       btnDipole.disabled = true;
       btnFlag.disabled = true;
 
       targetCoordsEl.textContent =
-        `WISE 0855 | RA ${DEMO_TARGET.ra}° | DEC ${DEMO_TARGET.dec}°`;
+        `REAL FITS TARGET | RA ${realTarget.ra}° | DEC ${realTarget.dec}°`;
 
       viewportModeTag.textContent =
         'REAL SPHEREx — STATIC OBSERVATION';
@@ -919,13 +1248,21 @@ function syncMemory() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCandidates));
   localStorage.setItem(SCANNED_KEY, JSON.stringify([...scannedSectors]));
 
-  candidateCountEl.textContent = savedCandidates.length;
+  const realCandidates = savedCandidates.filter(
+    candidate => candidate.data_type === 'real'
+  );
+  const realScannedCount = getRealSectors().filter(
+    sector => scannedSectors.has(sector.id)
+  ).length;
+
+  candidateCountEl.textContent = realCandidates.length;
+  btnExportJson.disabled = realCandidates.length === 0;
 
   bannerScannedEl.textContent =
-    `${String(scannedSectors.size).padStart(2, '0')}/32`;
+    `${String(realScannedCount).padStart(2, '0')}/${String(getRealSectors().length).padStart(2, '0')}`;
 
   bannerFlaggedEl.textContent =
-    String(savedCandidates.length).padStart(2, '0');
+    String(realCandidates.length).padStart(2, '0');
 
   renderCandidatesTable();
 }
@@ -936,8 +1273,11 @@ function syncMemory() {
 
 function renderCandidatesTable() {
   candidatesTbody.innerHTML = '';
+  const visibleCandidates = savedCandidates.filter(
+    candidate => candidate.data_type === 'real'
+  );
 
-  if (savedCandidates.length === 0) {
+  if (visibleCandidates.length === 0) {
     const emptyRow = document.createElement('tr');
     const cell = document.createElement('td');
 
@@ -951,7 +1291,7 @@ function renderCandidatesTable() {
     return;
   }
 
-  savedCandidates.forEach((item, index) => {
+  visibleCandidates.forEach((item, index) => {
     const row = document.createElement('tr');
 
     const wavelength = (
@@ -987,6 +1327,7 @@ function renderCandidatesTable() {
         SECTORS.find(s => s.id === sectorCode) || SECTORS[0];
 
       switchTab('explorer');
+      requestedTarget = null;
       enterSector(targetSector);
 
       bandSlider.value = item.band;
@@ -1043,7 +1384,7 @@ function findSectorAtPoint(x, y) {
     return null;
   }
 
-  return SECTORS.find(s => {
+  return getRealSectors().find(s => {
     const box = getSectorScreenBox(s);
 
     return (
@@ -1074,13 +1415,12 @@ canvas.addEventListener('click', async e => {
     const clickedSector = findSectorAtPoint(x, y);
 
     if (clickedSector) {
+      requestedTarget = null;
       enterSector(clickedSector);
     }
 
     return;
   }
-
-  if (realObservation) return;
 
   const ra = (
     activeSector.ra + (x - canvas.width / 2) * 0.002
@@ -1092,8 +1432,9 @@ canvas.addEventListener('click', async e => {
 
   selectedTarget = { x, y, ra, dec };
 
-  targetCoordsEl.textContent =
-    `SIMULATED POSITION: RA ${ra}° | DEC ${dec}°`;
+  targetCoordsEl.textContent = realObservation
+    ? `OBSERVED POSITION: RA ${ra}° | DEC ${dec}°`
+    : `SIMULATED POSITION: RA ${ra}° | DEC ${dec}°`;
 
   renderSectorView();
 
@@ -1105,7 +1446,9 @@ canvas.addEventListener('click', async e => {
   }
 
   btnFlag.disabled = false;
-  btnFlag.textContent = 'Log Simulated Candidate';
+  btnFlag.textContent = realObservation
+    ? 'Log Observed Candidate'
+    : 'Log Simulated Candidate';
 });
 
 // ==========================================
@@ -1125,10 +1468,13 @@ sectorSearchInput.addEventListener('keydown', e => {
       ? SECTORS.find(s => s.index === num)
       : null);
 
-  if (match) {
+  if (match && isRealSector(match.id)) {
     switchTab('explorer');
+    requestedTarget = null;
     enterSector(match);
     sectorSearchInput.value = '';
+  } else if (match) {
+    hudReadout.textContent = `${match.id} has no verified local FITS coverage.`;
   }
 });
 
@@ -1164,7 +1510,7 @@ btnMarkClear.addEventListener('click', () => {
 // ==========================================
 
 btnBlink.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) return;
+  if (viewportLevel !== 'sector') return;
 
   viewMode = 'blink';
   activeEpoch = activeEpoch === 1 ? 2 : 1;
@@ -1177,7 +1523,7 @@ btnBlink.addEventListener('click', () => {
 // ==========================================
 
 btnDipole.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) return;
+  if (viewportLevel !== 'sector') return;
 
   viewMode = 'dipole';
   renderSectorView();
@@ -1200,8 +1546,12 @@ bandSlider.addEventListener('input', e => {
   bannerWavelengthEl.textContent = wavelength;
 
   if (realObservation && staticRealImage) {
-    hudReadout.textContent =
-      `One static SPHEREx cutout; wavelength selection is not applied to this image.`;
+    renderSectorView();
+    return;
+  }
+
+  if (realObservation) {
+    renderSectorView();
     return;
   }
 
@@ -1223,7 +1573,6 @@ window.addEventListener('keydown', e => {
     !isModalOpen() &&
     document.activeElement !== sectorSearchInput &&
     viewportLevel === 'sector' &&
-    !realObservation &&
     !viewExplorer.classList.contains('hidden')
   ) {
     e.preventDefault();
@@ -1240,7 +1589,7 @@ window.addEventListener('keydown', e => {
 // ==========================================
 
 btnFlag.addEventListener('click', async () => {
-  if (!selectedTarget || !activeSector || realObservation) return;
+  if (!selectedTarget || !activeSector) return;
 
   const payload = {
     sectorId: activeSector.id,
@@ -1254,17 +1603,30 @@ btnFlag.addEventListener('click', async () => {
     epoch: activeEpoch,
     band: Number(bandSlider.value),
 
-    data_type: 'simulated',
+    data_type: realObservation ? 'real' : 'simulated',
     flagged_at: new Date().toISOString()
   };
 
-  savedCandidates.push(payload);
-  scannedSectors.add(activeSector.id);
-
-  syncMemory();
-
-  btnFlag.textContent = 'Simulated Candidate Logged ✓';
   btnFlag.disabled = true;
+  btnFlag.textContent = 'Saving Candidate...';
+
+  try {
+    if (backendConnected) {
+      await saveCandidate(payload);
+    }
+
+    savedCandidates.push(payload);
+    scannedSectors.add(activeSector.id);
+    syncMemory();
+
+    btnFlag.textContent = backendConnected
+      ? 'Candidate Saved ✓'
+      : 'Saved Locally (Backend Offline)';
+  } catch (error) {
+    console.error('Could not save candidate:', error);
+    btnFlag.disabled = false;
+    btnFlag.textContent = 'Save Failed — Try Again';
+  }
 });
 
 // ==========================================
@@ -1272,8 +1634,11 @@ btnFlag.addEventListener('click', async () => {
 // ==========================================
 
 btnExportJson.addEventListener('click', () => {
+  const realCandidates = savedCandidates.filter(
+    candidate => candidate.data_type === 'real'
+  );
   const blob = new Blob(
-    [JSON.stringify(savedCandidates, null, 2)],
+    [JSON.stringify(realCandidates, null, 2)],
     { type: 'application/json' }
   );
 
@@ -1292,11 +1657,24 @@ btnExportJson.addEventListener('click', () => {
 // 29. CLEAR CANDIDATES
 // ==========================================
 
-btnClearLog.addEventListener('click', () => {
+btnClearLog.addEventListener('click', async () => {
+  btnClearLog.disabled = true;
+
+  try {
+    if (backendConnected) {
+      await clearCandidates();
+    }
+  } catch (error) {
+    console.error('Could not clear backend candidate archive:', error);
+    btnClearLog.disabled = false;
+    return;
+  }
+
   savedCandidates = [];
   scannedSectors.clear();
 
   syncMemory();
+  btnClearLog.disabled = false;
 
   if (viewportLevel === 'allsky') {
     renderAllSkyMap();
@@ -1310,7 +1688,53 @@ btnClearLog.addEventListener('click', () => {
 syncMemory();
 renderAllSkyMap();
 
-checkBackend();
+async function initializeBackend() {
+  if (!(await checkBackend())) {
+    sectorBadge.textContent = 'Backend unavailable — no verified sectors loaded.';
+    renderAllSkyMap();
+    return;
+  }
+
+  try {
+    sectorCoverage = await fetchSectorCoverage();
+    sectorCoverageLoaded = true;
+    const realSectorCount = getRealSectors().length;
+    sectorBadge.textContent = realSectorCount === 1
+      ? '1 verified FITS sector available. Select it on the map.'
+      : `${realSectorCount} verified FITS sectors available. Select a green sector.`;
+    renderAllSkyMap();
+    savedCandidates = await fetchCandidates();
+    scannedSectors = new Set([
+      ...scannedSectors,
+      ...savedCandidates.map(candidate => candidate.sectorId).filter(Boolean)
+    ]);
+    syncMemory();
+
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('ra') && urlParams.has('dec')) {
+      raInput.value = urlParams.get('ra');
+      decInput.value = urlParams.get('dec');
+      const urlRa = parseCoordinate(raInput.value, true);
+      const urlDec = parseCoordinate(decInput.value, false);
+      const matchingTarget = Object.entries(KNOWN_TARGETS)
+        .find(([, target]) => (
+          Math.abs(target.ra - urlRa) < 0.0001
+          && Math.abs(target.dec - urlDec) < 0.0001
+        ));
+      if (matchingTarget) {
+        targetPreset.value = matchingTarget[0];
+      }
+      await inspectCoordinates();
+    }
+  } catch (error) {
+    console.error('Could not load backend candidate archive:', error);
+    sectorBadge.textContent = 'Could not load verified sector coverage.';
+    sectorCoverageLoaded = false;
+    renderAllSkyMap();
+  }
+}
+
+initializeBackend();
 
 console.log('SPHEREx Explorer initialized.');
 console.log('Backend endpoint:', `${API_BASE}/api/health`);

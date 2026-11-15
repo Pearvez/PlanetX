@@ -3,7 +3,8 @@ const USE_MOCK_DATA = true;
 const STORAGE_KEY = 'spherex_candidates';
 const SCANNED_KEY = 'spherex_scanned_sectors';
 
-// Real SPHEREx demonstration target: WISE 0855
+const API_BASE = '';
+
 const DEMO_TARGET = {
   ra: 133.795129,
   dec: -7.245147
@@ -13,9 +14,13 @@ const REAL_DEMO_SECTOR = 'SEC-19';
 const STATIC_IMAGE_PATH = '/data/target_cutout.png';
 const STATIC_OBSERVATION_DATE = '2025-05-05';
 
-// 1. Grab DOM elements
+// ==========================================
+// 1. DOM ELEMENTS
+// ==========================================
+
 const canvas = document.getElementById('sky-canvas');
 const ctx = canvas.getContext('2d');
+
 const sectorSearchInput = document.getElementById('sector-search');
 const logoHome = document.getElementById('logo-home');
 
@@ -47,12 +52,78 @@ const tabExplorer = document.getElementById('tab-explorer');
 const tabCandidates = document.getElementById('tab-candidates');
 const viewExplorer = document.getElementById('view-explorer');
 const viewCandidates = document.getElementById('view-candidates');
+
 const candidateCountEl = document.getElementById('candidate-count');
 const candidatesTbody = document.getElementById('candidates-tbody');
+
 const btnExportJson = document.getElementById('btn-export-json');
 const btnClearLog = document.getElementById('btn-clear-log');
 
-// 2. Mission Briefing & AI Disclosure Modal Controls
+// ==========================================
+// 2. BACKEND CONNECTION
+// ==========================================
+
+let backendConnected = false;
+
+async function checkBackend() {
+  try {
+    const response = await fetch(`${API_BASE}/api/health`);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    backendConnected = data.status === 'ok';
+
+    console.log('PLANETX BACKEND:', data);
+
+    return backendConnected;
+
+  } catch (error) {
+    backendConnected = false;
+
+    console.error('BACKEND CONNECTION FAILED:', error);
+
+    return false;
+  }
+}
+
+async function fetchSpherexCutout(ra, dec, size = 0.05) {
+  try {
+    const params = new URLSearchParams({
+      ra: String(ra),
+      dec: String(dec),
+      size: String(size)
+    });
+
+    const response = await fetch(
+      `${API_BASE}/api/cutout?${params.toString()}`
+    );
+
+    if (!response.ok) {
+      throw new Error(`Cutout API returned HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (data.status !== 'real_data' || !data.image) {
+      throw new Error(data.message || 'No real image returned.');
+    }
+
+    return data;
+
+  } catch (error) {
+    console.error('SPHEREx API ERROR:', error);
+    return null;
+  }
+}
+
+// ==========================================
+// 3. MODAL CONTROLS
+// ==========================================
+
 function openMissionModal() {
   missionModal.classList.remove('hidden');
 }
@@ -70,13 +141,16 @@ btnStartExploring.addEventListener('click', closeMissionModal);
 btnOpenGuide.addEventListener('click', openMissionModal);
 exploreTrigger.addEventListener('click', openMissionModal);
 
-missionModal.addEventListener('click', (e) => {
+missionModal.addEventListener('click', e => {
   if (e.target === missionModal) {
     closeMissionModal();
   }
 });
 
-// 3. Build 32 All-Sky Demonstration Sectors
+// ==========================================
+// 4. DEMONSTRATION SECTORS
+// ==========================================
+
 const GRID_COLS = 8;
 const GRID_ROWS = 4;
 const SECTORS = [];
@@ -100,7 +174,10 @@ for (let r = 0; r < GRID_ROWS; r++) {
   }
 }
 
-// 4. Application State
+// ==========================================
+// 5. APPLICATION STATE
+// ==========================================
+
 let viewportLevel = 'allsky';
 let activeSector = null;
 let hoveredSector = null;
@@ -125,7 +202,10 @@ let scannedSectors = new Set(
   JSON.parse(localStorage.getItem(SCANNED_KEY) || '[]')
 );
 
-// Deterministic random generator
+// ==========================================
+// 6. SEEDED RANDOM GENERATOR
+// ==========================================
+
 function createSeededRng(seed) {
   let s = seed * 2654435761;
 
@@ -137,7 +217,6 @@ function createSeededRng(seed) {
   };
 }
 
-// Generate simulated sector objects
 function getSectorData(sector) {
   const rng = createSeededRng(sector.index * 137);
 
@@ -168,7 +247,10 @@ function getSectorData(sector) {
   return { stars, mover };
 }
 
-// 5. All-Sky Map Renderer
+// ==========================================
+// 7. ALL-SKY MAP
+// ==========================================
+
 const MAP_CX = canvas.width / 2;
 const MAP_CY = canvas.height / 2;
 const MAP_RX = 296;
@@ -200,15 +282,7 @@ function renderAllSkyMap() {
   ctx.save();
 
   ctx.beginPath();
-  ctx.ellipse(
-    MAP_CX,
-    MAP_CY,
-    MAP_RX,
-    MAP_RY,
-    0,
-    0,
-    Math.PI * 2
-  );
+  ctx.ellipse(MAP_CX, MAP_CY, MAP_RX, MAP_RY, 0, 0, Math.PI * 2);
   ctx.clip();
 
   ctx.fillStyle = '#080d1a';
@@ -220,11 +294,7 @@ function renderAllSkyMap() {
   ctx.lineWidth = 34;
   ctx.beginPath();
 
-  for (
-    let x = MAP_CX - MAP_RX;
-    x <= MAP_CX + MAP_RX;
-    x += 8
-  ) {
+  for (let x = MAP_CX - MAP_RX; x <= MAP_CX + MAP_RX; x += 8) {
     const normX = (x - MAP_CX) / MAP_RX;
     const galY = MAP_CY + Math.sin(normX * Math.PI) * 65;
 
@@ -299,47 +369,28 @@ function renderAllSkyMap() {
 
       ctx.strokeStyle = '#38bdf8';
       ctx.lineWidth = 1.5;
-      ctx.strokeRect(
-        box.x + 1,
-        box.y + 1,
-        box.w - 2,
-        box.h - 2
-      );
+      ctx.strokeRect(box.x + 1, box.y + 1, box.w - 2, box.h - 2);
     } else {
       ctx.strokeStyle = 'rgba(51, 65, 85, 0.65)';
       ctx.lineWidth = 1;
       ctx.strokeRect(box.x, box.y, box.w, box.h);
     }
 
-    ctx.fillStyle = isHovered
-      ? '#f8fafc'
-      : 'rgba(148, 163, 184, 0.7)';
-
+    ctx.fillStyle = isHovered ? '#f8fafc' : 'rgba(148, 163, 184, 0.7)';
     ctx.font = '9px "JetBrains Mono", monospace';
     ctx.fillText(sector.id, box.x + 5, box.y + 13);
 
     if (hasCandidate) {
       ctx.fillStyle = '#f59e0b';
       ctx.beginPath();
-      ctx.arc(
-        box.x + box.w - 10,
-        box.y + box.h - 10,
-        3.5,
-        0,
-        Math.PI * 2
-      );
+      ctx.arc(box.x + box.w - 10, box.y + box.h - 10, 3.5, 0, Math.PI * 2);
       ctx.fill();
     }
 
     if (sector.id === REAL_DEMO_SECTOR) {
       ctx.strokeStyle = '#22c55e';
       ctx.lineWidth = 2;
-      ctx.strokeRect(
-        box.x + 3,
-        box.y + 3,
-        box.w - 6,
-        box.h - 6
-      );
+      ctx.strokeRect(box.x + 3, box.y + 3, box.w - 6, box.h - 6);
     }
   });
 
@@ -348,32 +399,20 @@ function renderAllSkyMap() {
   ctx.strokeStyle = '#38bdf8';
   ctx.lineWidth = 1.8;
   ctx.beginPath();
-
-  ctx.ellipse(
-    MAP_CX,
-    MAP_CY,
-    MAP_RX,
-    MAP_RY,
-    0,
-    0,
-    Math.PI * 2
-  );
-
+  ctx.ellipse(MAP_CX, MAP_CY, MAP_RX, MAP_RY, 0, 0, Math.PI * 2);
   ctx.stroke();
 
-  viewportModeTag.textContent =
-    'ALL-SKY DEMONSTRATION PROJECTION';
+  viewportModeTag.textContent = 'ALL-SKY DEMONSTRATION PROJECTION';
 
-  if (hoveredSector) {
-    hudReadout.textContent =
-      `${hoveredSector.id} // RA ${hoveredSector.ra}° DEC ${hoveredSector.dec}°`;
-  } else {
-    hudReadout.textContent =
-      'GREEN OUTLINE = REAL-DATA DEMO SECTOR | CLICK TO INSPECT';
-  }
+  hudReadout.textContent = hoveredSector
+    ? `${hoveredSector.id} // RA ${hoveredSector.ra}° DEC ${hoveredSector.dec}°`
+    : 'GREEN OUTLINE = REAL-DATA DEMO SECTOR | CLICK TO INSPECT';
 }
 
-// 6. Simulated Epoch Canvas Generator
+// ==========================================
+// 8. SIMULATED EPOCHS
+// ==========================================
+
 function buildMockEpochCanvas(sector, epochNum, band) {
   const offscreen = document.createElement('canvas');
 
@@ -397,20 +436,14 @@ function buildMockEpochCanvas(sector, epochNum, band) {
   });
 
   if (mover) {
-    const targetX = epochNum === 1
-      ? mover.e1x
-      : mover.e1x + mover.dx;
-
-    const targetY = epochNum === 1
-      ? mover.e1y
-      : mover.e1y + mover.dy;
+    const targetX = epochNum === 1 ? mover.e1x : mover.e1x + mover.dx;
+    const targetY = epochNum === 1 ? mover.e1y : mover.e1y + mover.dy;
 
     const irGlow = mover.type === 'cold_ir'
       ? Math.min(255, Math.floor(40 + (band / 102) * 215))
       : Math.min(255, Math.floor(220 - (band / 102) * 110));
 
     octx.fillStyle = `rgb(${irGlow}, ${irGlow}, ${irGlow})`;
-
     octx.beginPath();
     octx.arc(targetX, targetY, 3, 0, Math.PI * 2);
     octx.fill();
@@ -419,14 +452,16 @@ function buildMockEpochCanvas(sector, epochNum, band) {
   return offscreen;
 }
 
-// Draw selected-object reticle
+// ==========================================
+// 9. RETICLE
+// ==========================================
+
 function drawReticle(x, y) {
   const size = 14;
   const gap = 5;
 
   ctx.strokeStyle = '#e11d48';
   ctx.lineWidth = 2;
-
   ctx.beginPath();
 
   ctx.moveTo(x - size, y - gap);
@@ -448,18 +483,15 @@ function drawReticle(x, y) {
   ctx.stroke();
 }
 
-// 7. Sector Renderer
+// ==========================================
+// 10. SECTOR RENDERER
+// ==========================================
+
 function renderSectorView() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   if (realObservation && epoch1Source) {
-    ctx.drawImage(
-      epoch1Source,
-      0,
-      0,
-      canvas.width,
-      canvas.height
-    );
+    ctx.drawImage(epoch1Source, 0, 0, canvas.width, canvas.height);
 
     viewportModeTag.textContent = staticRealImage
       ? 'REAL SPHEREx — STATIC PREGENERATED OBSERVATION'
@@ -472,9 +504,7 @@ function renderSectorView() {
   }
 
   if (viewMode === 'blink') {
-    const src = activeEpoch === 1
-      ? epoch1Source
-      : epoch2Source;
+    const src = activeEpoch === 1 ? epoch1Source : epoch2Source;
 
     if (src) {
       ctx.drawImage(src, 0, 0);
@@ -491,19 +521,13 @@ function renderSectorView() {
 
     ctx.drawImage(epoch1Source, 0, 0);
 
-    const e1 = ctx.getImageData(
-      0, 0, canvas.width, canvas.height
-    );
+    const e1 = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
     ctx.drawImage(epoch2Source, 0, 0);
 
-    const e2 = ctx.getImageData(
-      0, 0, canvas.width, canvas.height
-    );
+    const e2 = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    const out = ctx.createImageData(
-      canvas.width, canvas.height
-    );
+    const out = ctx.createImageData(canvas.width, canvas.height);
 
     for (let i = 0; i < e1.data.length; i += 4) {
       const diff = e2.data[i] - e1.data[i];
@@ -528,7 +552,6 @@ function renderSectorView() {
   }
 }
 
-// 8. Render Frame
 function renderFrame() {
   if (viewportLevel === 'allsky') {
     renderAllSkyMap();
@@ -537,7 +560,10 @@ function renderFrame() {
   }
 }
 
-// 9. Enter Sector
+// ==========================================
+// 11. ENTER SECTOR
+// ==========================================
+
 function enterSector(sector) {
   activeSector = sector;
   viewportLevel = 'sector';
@@ -557,11 +583,11 @@ function enterSector(sector) {
   canvas.classList.add('sector-mode');
 
   sectorTitleEl.textContent = `Sector ${sector.id}`;
+
   sectorBadge.textContent =
     `Grid Coordinates: RA ${sector.ra}°, Dec ${sector.dec}°`;
 
-  targetCoordsEl.textContent =
-    'Click an object in this sector...';
+  targetCoordsEl.textContent = 'Click an object in this sector...';
 
   btnBackAllSky.disabled = false;
   btnMarkClear.disabled = false;
@@ -580,7 +606,10 @@ function enterSector(sector) {
   loadSkyPatch(Number(bandSlider.value));
 }
 
-// 10. Return to All-Sky
+// ==========================================
+// 12. RETURN TO ALL SKY
+// ==========================================
+
 function returnToAllSky() {
   viewportLevel = 'allsky';
   activeSector = null;
@@ -613,7 +642,10 @@ function returnToAllSky() {
   renderFrame();
 }
 
-// 11. Static SPHEREx image loader
+// ==========================================
+// 13. STATIC IMAGE FALLBACK
+// ==========================================
+
 function loadStaticRealImage() {
   return new Promise((resolve, reject) => {
     const img = new Image();
@@ -628,7 +660,10 @@ function loadStaticRealImage() {
   });
 }
 
-// 12. Load Real or Simulated Sky Patch
+// ==========================================
+// 14. LOAD REAL OR SIMULATED SKY PATCH
+// ==========================================
+
 async function loadSkyPatch(band) {
   if (viewportLevel === 'allsky') {
     renderAllSkyMap();
@@ -638,27 +673,17 @@ async function loadSkyPatch(band) {
   if (!activeSector) return;
 
   if (activeSector.id === REAL_DEMO_SECTOR) {
-    // First try the live Flask API.
     try {
-      hudReadout.textContent =
-        'CONNECTING TO SPHEREx DATA API...';
+      hudReadout.textContent = 'CONNECTING TO SPHEREx BACKEND...';
 
-      const url =
-        `/api/cutout?ra=${DEMO_TARGET.ra}` +
-        `&dec=${DEMO_TARGET.dec}&size=0.05`;
+      const data = await fetchSpherexCutout(
+        DEMO_TARGET.ra,
+        DEMO_TARGET.dec,
+        0.05
+      );
 
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error(
-          `API request failed with HTTP ${response.status}`
-        );
-      }
-
-      const data = await response.json();
-
-      if (data.status !== 'real_data' || !data.image) {
-        throw new Error('No real FITS image was returned.');
+      if (!data) {
+        throw new Error('Backend did not return real SPHEREx data.');
       }
 
       const img = new Image();
@@ -666,9 +691,8 @@ async function loadSkyPatch(band) {
       await new Promise((resolve, reject) => {
         img.onload = resolve;
         img.onerror = () => reject(
-          new Error('Browser could not decode the FITS image.')
+          new Error('Could not decode returned SPHEREx image.')
         );
-
         img.src = data.image;
       });
 
@@ -687,26 +711,20 @@ async function loadSkyPatch(band) {
       targetCoordsEl.textContent =
         `WISE 0855 | RA ${data.ra}° | DEC ${data.dec}°`;
 
-      viewportModeTag.textContent =
-        'REAL SPHEREx OBSERVATION';
+      viewportModeTag.textContent = 'REAL SPHEREx OBSERVATION';
 
       renderSectorView();
 
-      console.log('Real SPHEREx API image loaded:', data);
+      console.log('REAL SPHEREx DATA LOADED:', data);
 
       return;
 
     } catch (apiError) {
-      console.warn(
-        'SPHEREx API unavailable. Trying static image:',
-        apiError
-      );
+      console.warn('Backend unavailable; trying static image.', apiError);
     }
 
-    // If the API is unavailable, load the genuine pre-generated PNG.
     try {
-      hudReadout.textContent =
-        'LOADING PREGENERATED SPHEREx OBSERVATION...';
+      hudReadout.textContent = 'LOADING STATIC SPHEREx OBSERVATION...';
 
       const img = await loadStaticRealImage();
 
@@ -733,41 +751,25 @@ async function loadSkyPatch(band) {
 
       renderSectorView();
 
-      console.log(
-        'Loaded static genuine SPHEREx cutout:',
-        STATIC_IMAGE_PATH
-      );
+      console.log('STATIC REAL SPHEREx IMAGE LOADED.');
 
       return;
 
     } catch (imageError) {
-      console.error(
-        'Static SPHEREx image unavailable:',
-        imageError
-      );
+      console.error('Static image unavailable:', imageError);
 
       hudReadout.textContent =
         'REAL IMAGE UNAVAILABLE — USING SIMULATION';
     }
   }
 
-  // Clearly simulated fallback for other sectors or unavailable images.
   realObservation = false;
   realObservationDate = null;
   realObservationFile = null;
   staticRealImage = false;
 
-  epoch1Source = buildMockEpochCanvas(
-    activeSector,
-    1,
-    band
-  );
-
-  epoch2Source = buildMockEpochCanvas(
-    activeSector,
-    2,
-    band
-  );
+  epoch1Source = buildMockEpochCanvas(activeSector, 1, band);
+  epoch2Source = buildMockEpochCanvas(activeSector, 2, band);
 
   btnBlink.disabled = false;
   btnDipole.disabled = false;
@@ -776,7 +778,10 @@ async function loadSkyPatch(band) {
   renderSectorView();
 }
 
-// 13. Initialize 102-Band Demonstration Chart
+// ==========================================
+// 15. SPECTRUM CHART
+// ==========================================
+
 const WAVELENGTHS = Array.from(
   { length: 102 },
   (_, i) => (0.75 + (i / 101) * 4.25).toFixed(2)
@@ -814,14 +819,10 @@ if (typeof Chart !== 'undefined') {
         responsive: true,
         maintainAspectRatio: false,
 
-        animation: {
-          duration: 200
-        },
+        animation: { duration: 200 },
 
         plugins: {
-          legend: {
-            display: false
-          }
+          legend: { display: false }
         },
 
         scales: {
@@ -831,9 +832,7 @@ if (typeof Chart !== 'undefined') {
               maxTicksLimit: 6
             },
 
-            grid: {
-              color: '#1f293d'
-            },
+            grid: { color: '#1f293d' },
 
             title: {
               display: true,
@@ -843,14 +842,8 @@ if (typeof Chart !== 'undefined') {
           },
 
           y: {
-            ticks: {
-              color: '#94a3b8'
-            },
-
-            grid: {
-              color: '#1f293d'
-            },
-
+            ticks: { color: '#94a3b8' },
+            grid: { color: '#1f293d' },
             min: 0,
             max: 120
           }
@@ -860,17 +853,17 @@ if (typeof Chart !== 'undefined') {
   }
 }
 
-// 14. Simulated Spectrum Generator
+// ==========================================
+// 16. SIMULATED SPECTRUM
+// ==========================================
+
 function getMockSpectrum(sector, x, y) {
   const { mover } = getSectorData(sector);
 
   let moverType = null;
 
   if (mover) {
-    const distE1 = Math.hypot(
-      x - mover.e1x,
-      y - mover.e1y
-    );
+    const distE1 = Math.hypot(x - mover.e1x, y - mover.e1y);
 
     const distE2 = Math.hypot(
       x - (mover.e1x + mover.dx),
@@ -890,30 +883,24 @@ function getMockSpectrum(sector, x, y) {
       const methaneDip =
         Math.exp(-Math.pow((wl - 3.3) / 0.22, 2)) * 55;
 
-      return Math.max(
-        5,
-        25 + idx * 0.7 - methaneDip + noise
-      );
+      return Math.max(5, 25 + idx * 0.7 - methaneDip + noise);
     }
 
     if (moverType === 'asteroid') {
       const iceDip =
         Math.exp(-Math.pow((wl - 3.0) / 0.25, 2)) * 35;
 
-      return Math.max(
-        5,
-        75 - idx * 0.25 - iceDip + noise
-      );
+      return Math.max(5, 75 - idx * 0.25 - iceDip + noise);
     }
 
-    return Math.max(
-      5,
-      85 - idx * 0.55 + noise
-    );
+    return Math.max(5, 85 - idx * 0.55 + noise);
   });
 }
 
-// 15. Tab Navigation
+// ==========================================
+// 17. TAB NAVIGATION
+// ==========================================
+
 function switchTab(tabName) {
   const isExplorer = tabName === 'explorer';
 
@@ -924,17 +911,13 @@ function switchTab(tabName) {
   tabCandidates.classList.toggle('active', !isExplorer);
 }
 
-// 16. Save Application State
-function syncMemory() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify(savedCandidates)
-  );
+// ==========================================
+// 18. SAVE APPLICATION STATE
+// ==========================================
 
-  localStorage.setItem(
-    SCANNED_KEY,
-    JSON.stringify([...scannedSectors])
-  );
+function syncMemory() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCandidates));
+  localStorage.setItem(SCANNED_KEY, JSON.stringify([...scannedSectors]));
 
   candidateCountEl.textContent = savedCandidates.length;
 
@@ -947,7 +930,10 @@ function syncMemory() {
   renderCandidatesTable();
 }
 
-// 17. Candidate Table
+// ==========================================
+// 19. CANDIDATE TABLE
+// ==========================================
+
 function renderCandidatesTable() {
   candidatesTbody.innerHTML = '';
 
@@ -956,7 +942,6 @@ function renderCandidatesTable() {
     const cell = document.createElement('td');
 
     cell.colSpan = 7;
-
     cell.textContent =
       'No candidates archived yet. Select a sector to begin.';
 
@@ -984,9 +969,9 @@ function renderCandidatesTable() {
       new Date(item.flagged_at).toLocaleTimeString()
     ];
 
-    cells.forEach(text => {
+    cells.forEach(value => {
       const td = document.createElement('td');
-      td.textContent = text;
+      td.textContent = value;
       row.appendChild(td);
     });
 
@@ -1006,12 +991,9 @@ function renderCandidatesTable() {
 
       bandSlider.value = item.band;
 
-      bandLabel.textContent =
-        `${item.band} (${wavelength} µm)`;
+      bandLabel.textContent = `${item.band} (${wavelength} µm)`;
 
-      bannerBandEl.textContent =
-        String(item.band).padStart(3, '0');
-
+      bannerBandEl.textContent = String(item.band).padStart(3, '0');
       bannerWavelengthEl.textContent = wavelength;
 
       activeEpoch = item.epoch || 1;
@@ -1035,7 +1017,10 @@ function renderCandidatesTable() {
   });
 }
 
-// 18. Canvas Mouse Interaction
+// ==========================================
+// 20. CANVAS MOUSE INTERACTION
+// ==========================================
+
 function getCanvasCoords(e) {
   const rect = canvas.getBoundingClientRect();
 
@@ -1058,21 +1043,19 @@ function findSectorAtPoint(x, y) {
     return null;
   }
 
-  return (
-    SECTORS.find(s => {
-      const box = getSectorScreenBox(s);
+  return SECTORS.find(s => {
+    const box = getSectorScreenBox(s);
 
-      return (
-        x >= box.x &&
-        x <= box.x + box.w &&
-        y >= box.y &&
-        y <= box.y + box.h
-      );
-    }) || null
-  );
+    return (
+      x >= box.x &&
+      x <= box.x + box.w &&
+      y >= box.y &&
+      y <= box.y + box.h
+    );
+  }) || null;
 }
 
-canvas.addEventListener('mousemove', (e) => {
+canvas.addEventListener('mousemove', e => {
   if (viewportLevel !== 'allsky') return;
 
   const { x, y } = getCanvasCoords(e);
@@ -1084,7 +1067,7 @@ canvas.addEventListener('mousemove', (e) => {
   }
 });
 
-canvas.addEventListener('click', async (e) => {
+canvas.addEventListener('click', async e => {
   const { x, y } = getCanvasCoords(e);
 
   if (viewportLevel === 'allsky') {
@@ -1097,37 +1080,24 @@ canvas.addEventListener('click', async (e) => {
     return;
   }
 
-  if (realObservation) {
-    return;
-  }
+  if (realObservation) return;
 
   const ra = (
-    activeSector.ra +
-    (x - canvas.width / 2) * 0.002
+    activeSector.ra + (x - canvas.width / 2) * 0.002
   ).toFixed(4);
 
   const dec = (
-    activeSector.dec -
-    (y - canvas.height / 2) * 0.002
+    activeSector.dec - (y - canvas.height / 2) * 0.002
   ).toFixed(4);
 
-  selectedTarget = {
-    x,
-    y,
-    ra,
-    dec
-  };
+  selectedTarget = { x, y, ra, dec };
 
   targetCoordsEl.textContent =
     `SIMULATED POSITION: RA ${ra}° | DEC ${dec}°`;
 
   renderSectorView();
 
-  const fluxData = getMockSpectrum(
-    activeSector,
-    x,
-    y
-  );
+  const fluxData = getMockSpectrum(activeSector, x, y);
 
   if (spectrumChart) {
     spectrumChart.data.datasets[0].data = fluxData;
@@ -1138,16 +1108,16 @@ canvas.addEventListener('click', async (e) => {
   btnFlag.textContent = 'Log Simulated Candidate';
 });
 
-// 19. Search Bar
-sectorSearchInput.addEventListener('keydown', (e) => {
+// ==========================================
+// 21. SEARCH BAR
+// ==========================================
+
+sectorSearchInput.addEventListener('keydown', e => {
   if (e.key !== 'Enter') return;
 
   const raw = sectorSearchInput.value.trim().toUpperCase();
 
-  const num = parseInt(
-    raw.replace(/[^0-9]/g, ''),
-    10
-  );
+  const num = parseInt(raw.replace(/[^0-9]/g, ''), 10);
 
   const match =
     SECTORS.find(s => s.id === raw) ||
@@ -1162,17 +1132,17 @@ sectorSearchInput.addEventListener('keydown', (e) => {
   }
 });
 
-// 20. Navigation Buttons
-logoHome.addEventListener('click', (e) => {
-  e.preventDefault();
+// ==========================================
+// 22. NAVIGATION BUTTONS
+// ==========================================
 
+logoHome.addEventListener('click', e => {
+  e.preventDefault();
   switchTab('explorer');
   returnToAllSky();
 });
 
-tabExplorer.addEventListener('click', () => {
-  switchTab('explorer');
-});
+tabExplorer.addEventListener('click', () => switchTab('explorer'));
 
 tabCandidates.addEventListener('click', () => {
   renderCandidatesTable();
@@ -1185,16 +1155,16 @@ btnMarkClear.addEventListener('click', () => {
   if (!activeSector) return;
 
   scannedSectors.add(activeSector.id);
-
   syncMemory();
   returnToAllSky();
 });
 
-// 21. Blink Button
+// ==========================================
+// 23. BLINK BUTTON
+// ==========================================
+
 btnBlink.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) {
-    return;
-  }
+  if (viewportLevel !== 'sector' || realObservation) return;
 
   viewMode = 'blink';
   activeEpoch = activeEpoch === 1 ? 2 : 1;
@@ -1202,38 +1172,47 @@ btnBlink.addEventListener('click', () => {
   renderSectorView();
 });
 
-// 22. Dipole Button
+// ==========================================
+// 24. DIPOLE BUTTON
+// ==========================================
+
 btnDipole.addEventListener('click', () => {
-  if (viewportLevel !== 'sector' || realObservation) {
-    return;
-  }
+  if (viewportLevel !== 'sector' || realObservation) return;
 
   viewMode = 'dipole';
-
   renderSectorView();
 });
 
-// 23. Band Slider
-bandSlider.addEventListener('input', (e) => {
+// ==========================================
+// 25. BAND SLIDER
+// ==========================================
+
+bandSlider.addEventListener('input', e => {
   const band = Number(e.target.value);
 
   const wavelength = (
     0.75 + ((band - 1) / 101) * 4.25
   ).toFixed(2);
 
-  bandLabel.textContent =
-    `${band} (${wavelength} µm)`;
+  bandLabel.textContent = `${band} (${wavelength} µm)`;
 
-  bannerBandEl.textContent =
-    String(band).padStart(3, '0');
-
+  bannerBandEl.textContent = String(band).padStart(3, '0');
   bannerWavelengthEl.textContent = wavelength;
+
+  if (realObservation && staticRealImage) {
+    hudReadout.textContent =
+      `One static SPHEREx cutout; wavelength selection is not applied to this image.`;
+    return;
+  }
 
   loadSkyPatch(band);
 });
 
-// 24. Keyboard Controls
-window.addEventListener('keydown', (e) => {
+// ==========================================
+// 26. KEYBOARD CONTROLS
+// ==========================================
+
+window.addEventListener('keydown', e => {
   if (e.key === 'Escape' && isModalOpen()) {
     closeMissionModal();
     return;
@@ -1256,11 +1235,12 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-// 25. Flag Candidate
+// ==========================================
+// 27. FLAG SIMULATED CANDIDATE
+// ==========================================
+
 btnFlag.addEventListener('click', async () => {
-  if (!selectedTarget || !activeSector || realObservation) {
-    return;
-  }
+  if (!selectedTarget || !activeSector || realObservation) return;
 
   const payload = {
     sectorId: activeSector.id,
@@ -1287,7 +1267,10 @@ btnFlag.addEventListener('click', async () => {
   btnFlag.disabled = true;
 });
 
-// 26. Export Candidates
+// ==========================================
+// 28. EXPORT CANDIDATES
+// ==========================================
+
 btnExportJson.addEventListener('click', () => {
   const blob = new Blob(
     [JSON.stringify(savedCandidates, null, 2)],
@@ -1305,7 +1288,10 @@ btnExportJson.addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-// 27. Clear Candidate Log
+// ==========================================
+// 29. CLEAR CANDIDATES
+// ==========================================
+
 btnClearLog.addEventListener('click', () => {
   savedCandidates = [];
   scannedSectors.clear();
@@ -1317,10 +1303,16 @@ btnClearLog.addEventListener('click', () => {
   }
 });
 
-// 28. Initialize App
+// ==========================================
+// 30. INITIALIZE APPLICATION
+// ==========================================
+
 syncMemory();
 renderAllSkyMap();
 
+checkBackend();
+
 console.log('SPHEREx Explorer initialized.');
+console.log('Backend endpoint:', `${API_BASE}/api/health`);
 console.log('Real-data demonstration sector:', REAL_DEMO_SECTOR);
 console.log('Demo coordinates:', DEMO_TARGET);

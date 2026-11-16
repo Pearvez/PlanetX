@@ -19,7 +19,7 @@
         type="text"
         id="sector-search"
         class="spx-search"
-        placeholder="Jump to sector (e.g. SEC-12)"
+        placeholder="Verified sector (e.g. SEC-19)"
         aria-label="Jump to sky sector"
       />
     </div>
@@ -45,7 +45,7 @@
         Candidate Log <span id="candidate-count" class="count-badge">0</span>
       </button>
       <button id="btn-open-guide" class="nav-link">How to Use</button>
-      <span class="survey-pill"><span class="pulse-dot"></span> SIM_ACTIVE</span>
+      <span id="survey-status" class="survey-pill"><span class="pulse-dot"></span> CONNECTING</span>
     </nav>
   </header>
 
@@ -81,7 +81,26 @@
     <aside class="spx-panel">
       <span class="micro-label">SKY NAVIGATION</span>
       <h2 id="sector-title" class="panel-heading">All-Sky Survey</h2>
-      <p id="sector-badge" class="panel-subtext">32 sectors mapped across 360° RA / ±90° Dec.</p>
+      <p id="sector-badge" class="panel-subtext">Loading verified FITS sectors...</p>
+
+      <div class="coordinate-search">
+        <span class="micro-label">COORDINATE QUERY</span>
+        <label for="target-preset">Known target</label>
+        <select id="target-preset" class="spx-select">
+          <option value="">Choose a target...</option>
+          <option value="barnards-star">Barnard's Star</option>
+          <option value="epsilon-indi-b">Epsilon Indi B</option>
+          <option value="wise-0855">WISE 0855</option>
+          <option value="rw-aurigae">RW Aurigae</option>
+          <option value="r-draconis">R Draconis</option>
+        </select>
+        <label for="ra-input">Right Ascension (deg or hh:mm:ss)</label>
+        <input id="ra-input" class="spx-input" inputmode="decimal" placeholder="133.795129" />
+        <label for="dec-input">Declination (deg or dd:mm:ss)</label>
+        <input id="dec-input" class="spx-input" inputmode="decimal" placeholder="-7.245147" />
+        <button id="btn-inspect-coordinates" class="spx-btn secondary">Inspect Coordinates</button>
+        <p id="coordinate-status" class="form-status" aria-live="polite"></p>
+      </div>
 
       <div class="btn-stack">
         <button id="btn-back-allsky" class="spx-btn secondary" disabled>← All-Sky Map</button>
@@ -107,7 +126,7 @@
       <div class="legend-card">
         <span class="micro-label">SURVEY STATUS KEY</span>
         <div class="legend-row"><span class="status-dot cyan"></span> Active / Hovered Sector</div>
-        <div class="legend-row"><span class="status-dot green"></span> Verified Clear Sector</div>
+        <div class="legend-row"><span class="status-dot green"></span> Verified Real-Data Sector</div>
         <div class="legend-row"><span class="status-dot amber"></span> Moving Object Flagged</div>
       </div>
     </aside>
@@ -209,7 +228,7 @@
             <span class="step-num">01</span>
             <div>
               <strong>Choose a Sky Sector</strong>
-              <p>Click any of the 32 sectors on the All-Sky Map (or type <code>SEC-01</code> to <code>SEC-32</code> in the search bar) to inspect that patch of sky.</p>
+              <p>Choose a known target or enter RA/Dec coordinates to inspect real FITS data. Green sectors on the map are also available.</p>
             </div>
           </div>
 

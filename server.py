@@ -1,590 +1,287 @@
 
 from pathlib import Path
-from datetime import datetime, timezone
 from functools import lru_cache
 from io import BytesIO
 import base64
-import json
-import logging
+import os
 
-import numpy as np
 import requests
-
+import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS # type: ignore
+from astropy.coordinates import SkyCoord
 from astropy_healpix import HEALPix
 import astropy.units as u
-from PIL import Image
 
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
+# ============================================================
+# PLANETX — FULL-SKY SPHEREx EXPLORER
+# ============================================================
 
-ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
-CANDIDATES_FILE = Path("/tmp/planetx_candidates.json")
+app = Flask(__name__, static_folder=".")
+CORS(app)
 
-app = Flask(__name__)
+BASE_DIR = Path(__file__).resolve().parent
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("planetx")
-
-# Verified SPHEREx DR1 All-Sky Cube HiPS PNG service
-HIPS_BASE_URL = (
+# Official SPHEREx HiPS source
+HIPS_BASE = (
     "https://irsa.ipac.caltech.edu/data/hips/"
     "SPHEREx/spherex_allsky_cube"
 )
 
-HEALPIX_ORDER = 5
-NSIDE = 2 ** HEALPIX_ORDER
+# Full-sky HEALPix configuration
+NSIDE = 32
 TOTAL_SKY_TILES = 12 * NSIDE * NSIDE
-
 TOTAL_CHANNELS = 102
-FIRST_FRAME = 1
-LAST_FRAME = 102
 
-HEALPIX = HEALPix(
+# SPHEREx HiPS uses nested HEALPix ordering
+healpix = HEALPix(
     nside=NSIDE,
-    order="nested"
+    order="nested",
+    frame="icrs"
 )
-
-HTTP_TIMEOUT = (10, 30)
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "PlanetX-SPHEREx-Sky-Explorer/1.0"
+    "User-Agent": "PlanetX-SPHEREx-Explorer/1.0"
 })
 
 
-# ==================================================
-# HELPERS
-# ==================================================
+# ============================================================
+# HEALTH
+# ============================================================
 
-def error_response(message, status=400):
-    return jsonify({
-        "status": "error",
-        "error": message
-    }), status
-
-
-def validate_coordinates(ra, dec):
-    try:
-        ra = float(ra)
-        dec = float(dec)
-    except (TypeError, ValueError):
-        raise ValueError("RA and Dec must be numbers.")
-
-    if not np.isfinite(ra) or not np.isfinite(dec):
-        raise ValueError("Coordinates must be finite.")
-
-    if not 0 <= ra < 360:
-        raise ValueError("RA must be between 0 and 360.")
-
-    if not -90 <= dec <= 90:
-        raise ValueError("Dec must be between -90 and 90.")
-
-    return ra, dec
-
-
-def get_tile_index(ra, dec):
-    ra, dec = validate_coordinates(ra, dec)
-
-    index = HEALPIX.lonlat_to_healpix(
-        ra * u.deg,
-        dec * u.deg
-    )
-
-    return int(index) # type: ignore
-
-
-def get_tile_center(tile_index):
-    if not 0 <= tile_index < TOTAL_SKY_TILES:
-        raise ValueError("Invalid HEALPix tile index.")
-
-    lon, lat = HEALPIX.healpix_to_lonlat(tile_index)
-
-    return {
-        "ra": float(lon.deg), # type: ignore
-        "dec": float(lat.deg) # type: ignore
-    }
-
-
-def get_tile_directory(tile_index):
-    return (tile_index // 10000) * 10000
-
-
-def get_png_url(tile_index, frame):
-    """
-    Construct the verified SPHEREx HiPS PNG URL.
-
-    HiPS cube frames are numbered 1 through 102.
-    """
-
-    directory = get_tile_directory(tile_index)
-
-    return (
-        f"{HIPS_BASE_URL}/"
-        f"Norder{HEALPIX_ORDER}/"
-        f"Dir{directory}/"
-        f"Npix{tile_index}_{frame}.png"
-    )
-
-
-# ==================================================
-# DOWNLOAD AND CACHE PNG TILES
-# ==================================================
-
-@lru_cache(maxsize=128)
-def download_hips_tile(tile_index, frame):
-    """
-    Download one lightweight SPHEREx PNG tile.
-
-    The cache avoids downloading the same tile/frame
-    repeatedly while the Python process remains alive.
-    """
-
-    url = get_png_url(tile_index, frame)
-
-    logger.info(
-        "Fetching SPHEREx PNG: tile=%s frame=%s",
-        tile_index,
-        frame
-    )
-
-    response = session.get(
-        url,
-        timeout=HTTP_TIMEOUT
-    )
-
-    if response.status_code == 404:
-        raise FileNotFoundError(
-            f"No PNG data available for tile {tile_index}, "
-            f"frame {frame}."
-        )
-
-    response.raise_for_status()
-
-    content = response.content
-
-    # Verify that the archive actually returned an image.
-    try:
-        with Image.open(BytesIO(content)) as image:
-            if image.format != "PNG":
-                raise ValueError("Archive response is not a PNG.")
-
-            image.verify()
-
-    except Exception as error:
-        raise ValueError(
-            f"Invalid PNG returned by SPHEREx: {error}"
-        )
-
-    return content
-
-
-def make_tile_response(ra, dec, frame):
-    tile_index = get_tile_index(ra, dec)
-
-    png_bytes = download_hips_tile(
-        tile_index,
-        frame
-    )
-
-    with Image.open(BytesIO(png_bytes)) as image:
-        width, height = image.size
-
-    encoded = base64.b64encode(
-        png_bytes
-    ).decode("ascii")
-
-    return {
-        "status": "ok",
-        "real_data": True,
-        "source": "SPHEREx DR1 All-Sky Cube HiPS",
-        "projection": "HEALPix",
-        "ordering": "NESTED",
-        "order": HEALPIX_ORDER,
-        "total_sky_tiles": TOTAL_SKY_TILES,
-        "tile_id": tile_index,
-        "tile_center": get_tile_center(tile_index),
-        "ra": ra,
-        "dec": dec,
-        "channel": frame,
-        "frame": frame,
-        "total_channels": TOTAL_CHANNELS,
-        "image": encoded,
-        "image_base64": encoded,
-        "data_url": "data:image/png;base64," + encoded,
-        "image_width": width,
-        "image_height": height,
-        "fits_url": (
-            "https://irsa.ipac.caltech.edu/ibe/data/spherex/"
-            "dr1/hips5_cube/hips_20261026/"
-            f"Norder5/Dir{get_tile_directory(tile_index)}/"
-            f"Npix{tile_index}_cube.fits"
-        ),
-        "retrieved_at": datetime.now(
-            timezone.utc
-        ).isoformat()
-    }
-
-
-# ==================================================
-# FULL SKY INFORMATION
-# ==================================================
-
-@app.route("/api/health", methods=["GET"])
+@app.route("/api/health")
 def health():
     return jsonify({
-        "status": "ok",
-        "service": "PlanetX SPHEREx Sky Explorer",
-        "archive": "IRSA",
-        "archive_connection": "HiPS PNG",
-        "all_sky_cube": True,
-        "cube_release": "DR1",
-        "healpix_order": HEALPIX_ORDER,
-        "healpix_ordering": "NESTED",
-        "total_sky_tiles": TOTAL_SKY_TILES,
-        "spectral_channels": TOTAL_CHANNELS,
-        "first_frame": FIRST_FRAME,
-        "last_frame": LAST_FRAME,
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat()
+        "status": "online",
+        "project": "PlanetX",
+        "data_source": "NASA/IPAC SPHEREx HiPS",
+        "nside": NSIDE,
+        "total_tiles": TOTAL_SKY_TILES,
+        "total_channels": TOTAL_CHANNELS
     })
 
 
-@app.route("/api/sky/info", methods=["GET"])
+# ============================================================
+# SKY INFORMATION
+# ============================================================
+
+@app.route("/api/sky/info")
 def sky_info():
     return jsonify({
         "status": "ok",
-        "name": "SPHEREx DR1 All-Sky Cube",
-        "hips_url": HIPS_BASE_URL,
-        "projection": "HEALPix",
-        "ordering": "NESTED",
-        "order": HEALPIX_ORDER,
         "nside": NSIDE,
         "total_tiles": TOTAL_SKY_TILES,
         "total_channels": TOTAL_CHANNELS,
-        "first_frame": FIRST_FRAME,
-        "last_frame": LAST_FRAME,
-        "tile_width": 512
+        "first_channel": 1,
+        "last_channel": TOTAL_CHANNELS,
+        "hips_url": HIPS_BASE
     })
 
 
-# ==================================================
-# ALL 12,288 SKY TILES
-# ==================================================
+# ============================================================
+# TILE COORDINATES
+# ============================================================
 
-@app.route("/api/sky/tiles", methods=["GET"])
-def sky_tiles():
-    """
-    Return coordinates for every tile.
+def get_tile_coordinates(tile_id):
+    if not 0 <= tile_id < TOTAL_SKY_TILES:
+        raise ValueError("Invalid tile ID")
 
-    Example:
-    /api/sky/tiles?offset=0&limit=1000
-    """
+    coordinate = healpix.healpix_to_skycoord(tile_id)
 
+    assert coordinate.icrs is not None
+    assert coordinate.icrs.ra is not None
+    assert coordinate.icrs.dec is not None
+    return {
+        "tile_id": int(tile_id),
+        "ra": float(coordinate.icrs.ra.deg), # type: ignore
+        "dec": float(coordinate.icrs.dec.deg) # type: ignore
+    }
+
+
+@app.route("/api/sky/tiles")
+def get_all_sky_tiles():
     try:
         offset = int(request.args.get("offset", 0))
         limit = int(request.args.get("limit", 1000))
 
         if offset < 0:
-            return error_response(
-                "Offset cannot be negative."
-            )
+            raise ValueError()
 
-        if limit < 1:
-            return error_response(
-                "Limit must be positive."
-            )
+        limit = max(1, min(limit, 2000))
 
-        limit = min(limit, TOTAL_SKY_TILES)
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid offset or limit"
+        }), 400
 
-        end = min(
-            offset + limit,
-            TOTAL_SKY_TILES
+    end = min(offset + limit, TOTAL_SKY_TILES)
+
+    tiles = [
+        get_tile_coordinates(tile_id)
+        for tile_id in range(offset, end)
+    ]
+
+    return jsonify({
+        "status": "ok",
+        "total_tiles": TOTAL_SKY_TILES,
+        "offset": offset,
+        "count": len(tiles),
+        "has_more": end < TOTAL_SKY_TILES,
+        "tiles": tiles
+    })
+
+
+# ============================================================
+# FIND TILE FROM SKY COORDINATES
+# ============================================================
+
+@app.route("/api/sky/locate")
+def locate_tile():
+    try:
+        ra = float(request.args["ra"])
+        dec = float(request.args["dec"])
+
+        if not 0 <= ra < 360 or not -90 <= dec <= 90:
+            raise ValueError()
+
+        coordinate = SkyCoord(
+            ra=ra * u.deg,
+            dec=dec * u.deg,
+            frame="icrs"
         )
 
-        if offset >= TOTAL_SKY_TILES:
-            return jsonify({
-                "status": "ok",
-                "tiles": [],
-                "total_tiles": TOTAL_SKY_TILES,
-                "returned": 0
-            })
-
-        indices = np.arange(offset, end)
-
-        lon, lat = HEALPIX.healpix_to_lonlat(indices)
-
-        tiles = []
-
-        for i, index in enumerate(indices):
-            tiles.append({
-                "id": int(index),
-                "ra": float(lon.deg[i]), # type: ignore
-                "dec": float(lat.deg[i]), # type: ignore
-                "status": "not_checked"
-            })
+        tile_id = int(healpix.skycoord_to_healpix(coordinate)) # type: ignore
 
         return jsonify({
             "status": "ok",
-            "projection": "HEALPix",
-            "ordering": "NESTED",
-            "order": HEALPIX_ORDER,
-            "total_tiles": TOTAL_SKY_TILES,
-            "offset": offset,
-            "returned": len(tiles),
-            "tiles": tiles
+            **get_tile_coordinates(tile_id)
         })
 
-    except Exception as error:
-        logger.exception("Tile generation failed")
-        return error_response(str(error), 500)
+    except (KeyError, ValueError):
+        return jsonify({
+            "status": "error",
+            "message": "Provide valid RA and Dec coordinates"
+        }), 400
 
 
-# ==================================================
-# REAL SPHEREX IMAGE FOR ANY SKY COORDINATE
-# ==================================================
+# ============================================================
+# DOWNLOAD SPHEREx HiPS TILE
+# ============================================================
 
-@app.route("/api/sky/tile", methods=["GET"])
-def sky_tile():
+@lru_cache(maxsize=256)
+def download_hips_tile(tile_id, channel):
     """
-    Retrieve a real PNG tile for any RA/Dec.
+    Download one SPHEREx HiPS image.
 
-    Example:
-    /api/sky/tile?ra=133.795129&dec=-7.245147&channel=1
+    Images are retrieved only when requested.
+    The cache avoids repeatedly downloading the same tile.
     """
+
+    directory = (tile_id // 10000) * 10000
+
+    url = (
+        f"{HIPS_BASE}/Norder5/"
+        f"Dir{directory}/"
+        f"Npix{tile_id}_{channel}.png"
+    )
 
     try:
-        ra, dec = validate_coordinates(
-            request.args.get("ra"),
-            request.args.get("dec")
-        )
+        response = session.get(url, timeout=30)
 
-        frame = int(
-            request.args.get(
-                "channel",
-                request.args.get("frame", 1)
-            )
-        )
+        if response.status_code != 200:
+            return None
 
-        if not FIRST_FRAME <= frame <= LAST_FRAME:
-            return error_response(
-                "Frame must be between 1 and 102."
-            )
+        content_type = response.headers.get(
+            "Content-Type", ""
+        ).lower()
 
-        result = make_tile_response(
-            ra,
-            dec,
-            frame
-        )
+        if "image/png" not in content_type:
+            return None
 
-        return jsonify(result)
+        return response.content
 
-    except FileNotFoundError as error:
+    except requests.RequestException:
+        return None
+
+
+# ============================================================
+# GET ONE SKY TILE IMAGE
+# ============================================================
+
+@app.route("/api/sky/tile")
+def get_sky_tile():
+    try:
+        tile_id = int(request.args["tile"])
+        channel = int(request.args.get("channel", 1))
+
+        if not 0 <= tile_id < TOTAL_SKY_TILES:
+            raise ValueError()
+
+        if not 1 <= channel <= TOTAL_CHANNELS:
+            raise ValueError()
+
+    except (KeyError, ValueError):
         return jsonify({
-            "status": "no_data",
-            "real_data": False,
-            "error": str(error)
+            "status": "error",
+            "message": "Invalid tile or channel"
+        }), 400
+
+    image_bytes = download_hips_tile(tile_id, channel)
+
+    if image_bytes is None:
+        return jsonify({
+            "status": "unavailable",
+            "tile_id": tile_id,
+            "channel": channel,
+            "message": "No image available for this tile/channel"
         }), 404
 
-    except requests.RequestException as error:
-        logger.exception("SPHEREx archive request failed")
-        return error_response(
-            f"SPHEREx archive request failed: {error}",
-            502
-        )
+    image_data = base64.b64encode(
+        image_bytes
+    ).decode("utf-8")
 
-    except Exception as error:
-        logger.exception("Sky tile request failed")
-        return error_response(str(error), 500)
+    coordinates = get_tile_coordinates(tile_id)
 
-
-# ==================================================
-# COMPATIBILITY: EXISTING FRONTEND
-# ==================================================
-
-@app.route("/api/cutout", methods=["GET"])
-def cutout():
-    """
-    Compatibility endpoint for the old frontend.
-
-    Returns a HiPS PNG tile, not a small angular cutout.
-    """
-
-    try:
-        ra, dec = validate_coordinates(
-            request.args.get("ra"),
-            request.args.get("dec")
-        )
-
-        frame = int(
-            request.args.get(
-                "channel",
-                request.args.get("band", 1)
-            )
-        )
-
-        if not FIRST_FRAME <= frame <= LAST_FRAME:
-            return error_response(
-                "Frame must be between 1 and 102."
-            )
-
-        return jsonify(
-            make_tile_response(ra, dec, frame)
-        )
-
-    except FileNotFoundError as error:
-        return jsonify({
-            "status": "no_data",
-            "real_data": False,
-            "error": str(error)
-        }), 404
-
-    except requests.RequestException as error:
-        return error_response(
-            f"SPHEREx archive request failed: {error}",
-            502
-        )
-
-    except Exception as error:
-        logger.exception("Cutout failed")
-        return error_response(str(error), 500)
+    return jsonify({
+        "status": "ok",
+        **coordinates,
+        "channel": channel,
+        "source": "SPHEREx HiPS",
+        "image": f"data:image/png;base64,{image_data}"
+    })
 
 
-# ==================================================
-# OBSERVATION / COORDINATE LOOKUP
-# ==================================================
-
-@app.route("/api/observations", methods=["GET"])
-def observations():
-    try:
-        ra, dec = validate_coordinates(
-            request.args.get("ra"),
-            request.args.get("dec")
-        )
-
-        tile_index = get_tile_index(ra, dec)
-
-        return jsonify({
-            "status": "ok",
-            "source": "SPHEREx DR1 All-Sky Cube",
-            "ra": ra,
-            "dec": dec,
-            "tile_id": tile_index,
-            "tile_center": get_tile_center(tile_index),
-            "ordering": "NESTED",
-            "channels": TOTAL_CHANNELS,
-            "hips_url_frame_1": get_png_url(
-                tile_index,
-                1
-            )
-        })
-
-    except Exception as error:
-        return error_response(str(error), 400)
-
-
-# ==================================================
-# CANDIDATE STORAGE
-# ==================================================
-
-@app.route("/api/candidates", methods=["GET", "POST"])
-def candidates():
-
-    if request.method == "POST":
-        candidate = request.get_json(silent=True)
-
-        if candidate is None:
-            return error_response(
-                "A valid JSON candidate is required."
-            )
-
-        try:
-            if CANDIDATES_FILE.exists():
-                with open(
-                    CANDIDATES_FILE,
-                    "r",
-                    encoding="utf-8"
-                ) as file:
-                    saved = json.load(file)
-            else:
-                saved = []
-
-            if not isinstance(saved, list):
-                saved = []
-
-            saved.append(candidate)
-
-            with open(
-                CANDIDATES_FILE,
-                "w",
-                encoding="utf-8"
-            ) as file:
-                json.dump(saved, file, indent=2)
-
-            return jsonify({
-                "status": "ok",
-                "saved": True,
-                "total_candidates": len(saved)
-            })
-
-        except Exception as error:
-            return error_response(str(error), 500)
-
-    try:
-        if CANDIDATES_FILE.exists():
-            with open(
-                CANDIDATES_FILE,
-                "r",
-                encoding="utf-8"
-            ) as file:
-                saved = json.load(file)
-        else:
-            saved = []
-
-        return jsonify({
-            "status": "ok",
-            "candidates": saved
-        })
-
-    except Exception as error:
-        return error_response(str(error), 500)
-
-
-# ==================================================
-# FRONTEND ROUTES
-# ==================================================
+# ============================================================
+# FRONTEND
+# ============================================================
 
 @app.route("/")
 def index():
-    return send_from_directory(ROOT, "index.html")
+    return send_from_directory(BASE_DIR, "index.html")
 
 
-@app.route("/app.js")
-def app_js():
-    return send_from_directory(ROOT, "app.js")
+@app.route("/<path:filename>")
+def frontend_files(filename):
+    allowed = {"app.js", "styles.css"}
+
+    if filename in allowed:
+        return send_from_directory(BASE_DIR, filename)
+
+    return jsonify({"error": "Not found"}), 404
 
 
-@app.route("/styles.css")
-def styles():
-    return send_from_directory(ROOT, "styles.css")
-
-
-@app.route("/data/<path:filename>")
-def data_files(filename):
-    return send_from_directory(DATA_DIR, filename)
-
-
-# ==================================================
+# ============================================================
 # START SERVER
-# ==================================================
+# ============================================================
 
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+
     app.run(
         host="0.0.0.0",
-        port=5000,
+        port=port,
         debug=False
     )

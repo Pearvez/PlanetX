@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -23,7 +24,6 @@
       />
     </div>
 
-    <!-- Original Geometric Spectral-Prism Telescope Emblem (No Agency Branding) -->
     <a href="#top" id="logo-home" class="spx-brand" title="Return to All-Sky Survey Map">
       <svg width="36" height="36" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
         <polygon points="24,4 42,14 42,34 24,44 6,34 6,14" stroke="#38bdf8" stroke-width="2" fill="#0b1120" />
@@ -54,12 +54,12 @@
     <div class="banner-title">All-Sky Near-Infrared Time-Domain Explorer</div>
     <div class="banner-metrics">
       <div class="metric-unit">
-        <span class="metric-num" id="banner-band">050</span>
+        <span class="metric-num" id="banner-band">001</span>
         <span class="metric-sub">IR BAND</span>
       </div>
       <span class="metric-sep">:</span>
       <div class="metric-unit">
-        <span class="metric-num" id="banner-wavelength">2.85</span>
+        <span class="metric-num" id="banner-wavelength">—</span>
         <span class="metric-sub">MICRONS</span>
       </div>
       <span class="metric-sep">:</span>
@@ -78,7 +78,6 @@
 
   <!-- TAB 1: Sky Explorer Workspace -->
   <main id="view-explorer" class="workspace-grid">
-    <!-- Left Sidebar: Navigation & Instrument Controls -->
     <aside class="spx-panel">
       <span class="micro-label">SKY NAVIGATION</span>
       <h2 id="sector-title" class="panel-heading">All-Sky Survey</h2>
@@ -94,9 +93,11 @@
       <span class="micro-label">SPECTROPHOTOMETER (0.75–5.0 µm)</span>
       <div class="slider-header">
         <span>Wavelength Band</span>
-        <span id="band-label" class="mono-readout">50 (2.85 µm)</span>
+        <span id="band-label" class="mono-readout">1 / 102</span>
       </div>
-      <input type="range" id="band-slider" class="spectral-slider" min="1" max="102" value="50" />
+
+      <!-- Updated: starts at channel 1 -->
+      <input type="range" id="band-slider" class="spectral-slider" min="1" max="102" value="1" />
 
       <div class="btn-stack">
         <button id="btn-blink" class="spx-btn secondary" disabled>Blink Epochs (Space)</button>
@@ -111,7 +112,7 @@
       </div>
     </aside>
 
-    <!-- Center Viewport: All-Sky Map & Sector Blink Comparator -->
+    <!-- Center Viewport -->
     <section class="spx-panel viewport-center">
       <div class="viewport-topbar">
         <span class="micro-label" id="viewport-mode-tag">ALL-SKY CELESTIAL PROJECTION</span>
@@ -122,7 +123,6 @@
         <canvas id="sky-canvas" width="640" height="360"></canvas>
       </div>
 
-      <!-- Bottom 3-Column Workflow Strip -->
       <div class="spx-feature-strip">
         <div class="feature-col">
           <span class="micro-label">STEP 01 // SURVEY</span>
@@ -139,7 +139,7 @@
       </div>
     </section>
 
-    <!-- Right Sidebar: 102-Band Spectrometry & Candidate Flagging -->
+    <!-- Right Sidebar -->
     <aside class="spx-panel">
       <span class="micro-label">OBJECT SPECTROMETRY</span>
       <h2 class="panel-heading">102-Band Profile</h2>
@@ -157,7 +157,7 @@
     </aside>
   </main>
 
-  <!-- TAB 2: Persistent Candidate Memory Log -->
+  <!-- TAB 2: Candidate Log -->
   <section id="view-candidates" class="candidates-container hidden">
     <div class="candidates-wrapper">
       <div class="candidates-header">
@@ -190,7 +190,7 @@
     </div>
   </section>
 
-  <!-- Mission Briefing, How-To & AI Utilization Disclosure Modal -->
+  <!-- Mission Briefing Modal -->
   <div id="mission-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-card">
       <div class="modal-top-bar">
@@ -217,23 +217,23 @@
             <span class="step-num">02</span>
             <div>
               <strong>Blink Epochs or View Dipole Difference</strong>
-              <p>Press <strong>Spacebar</strong> (or click <em>Blink Epochs</em>) to flip between 6-month snapshots. Switch to <em>Dipole Difference Map</em> to highlight moving sources as a crimson/cyan pair.</p>
+              <p>These comparison features require paired epoch observations and will be enabled when that data is integrated.</p>
             </div>
           </div>
 
           <div class="step-card">
             <span class="step-num">03</span>
             <div>
-              <strong>Inspect the 102-Band Spectrum</strong>
-              <p>Click any moving dot to lock the reticle and plot its infrared flux curve. Scrub the band slider—icy Planet X / brown dwarf candidates show a methane dip near <strong>3.3 µm</strong>.</p>
+              <strong>Inspect the 102-Band Data</strong>
+              <p>Use the band slider to request an available SPHEREx image channel. Not every tile has an image in every channel.</p>
             </div>
           </div>
 
           <div class="step-card">
             <span class="step-num">04</span>
             <div>
-              <strong>Flag Discoveries or Clear Sectors</strong>
-              <p>Click <strong>Flag Moving Candidate</strong> to archive the coordinates in your <em>Candidate Log</em> tab, or click <strong>Mark Sector Clear</strong> to return to the full sky.</p>
+              <strong>Flag or Clear</strong>
+              <p>Use the candidate log to save sky positions for further investigation. A flagged position is not a confirmed moving object.</p>
             </div>
           </div>
         </div>
@@ -244,8 +244,8 @@
             <strong>Authors:</strong> Parvez, Shravan. Credit to AI for implementing some coding features, but ideas were completely ours.
           </p>
           <ul class="ai-disclosure-list">
-            <li><strong>Where AI Was Utilized:</strong> Frontend HTML/CSS layout scaffolding, HTML5 Canvas elliptical projection &amp; pixel-subtraction rendering in <code>app.js</code>, Chart.js 102-band configuration, and <code>localStorage</code> state persistence.</li>
-            <li><strong>Original Human Contributions:</strong> Project concept, citizen-science blink/dipole workflow, 32-sector all-sky navigation design, spectral diagnostic criteria, and Python backend architecture.</li>
+            <li><strong>Where AI Was Utilized:</strong> Frontend HTML/CSS layout scaffolding, HTML5 Canvas rendering in <code>app.js</code>, Chart.js configuration, and <code>localStorage</code> state persistence.</li>
+            <li><strong>Original Human Contributions:</strong> Project concept, citizen-science workflow, all-sky navigation design, and Python backend architecture.</li>
           </ul>
         </div>
 

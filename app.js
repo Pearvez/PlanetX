@@ -1,7 +1,8 @@
 
 // ============================================================
 // PLANETX — FULL-SKY SPHEREx EXPLORER
-// Uses the SPHEREx DR1 HiPS PNG endpoint through Flask.
+// SPHEREx DR1 HiPS PNG endpoint through Flask.
+// Displays all 12,288 HEALPix tile centers.
 // ============================================================
 
 // ==========================================
@@ -19,6 +20,7 @@ const TILE_PAGE_SIZE = 1000;
 
 let SECTORS = [];
 let tilesLoaded = false;
+
 let hoveredSector = null;
 let activeSector = null;
 let viewportLevel = 'allsky';
@@ -30,7 +32,11 @@ let tileRequestNumber = 0;
 let tileDataStatus = 'Connecting to SPHEREx...';
 
 let savedCandidates = loadLocalArray(STORAGE_KEY);
-let scannedSectors = new Set(loadLocalArray(SCANNED_KEY));
+let scannedSectors = new Set(
+  loadLocalArray(SCANNED_KEY).map(String)
+);
+
+let backendConnected = false;
 
 // ==========================================
 // 2. DOM ELEMENTS
@@ -55,19 +61,25 @@ const bannerFlaggedEl = document.getElementById('banner-flagged');
 
 const sectorTitleEl = document.getElementById('sector-title');
 const sectorBadge = document.getElementById('sector-badge');
+
 const btnBackAllSky = document.getElementById('btn-back-allsky');
 const btnMarkClear = document.getElementById('btn-mark-clear');
+
 const bandSlider = document.getElementById('band-slider');
 const bandLabel = document.getElementById('band-label');
+
 const viewportModeTag = document.getElementById('viewport-mode-tag');
 const hudReadout = document.getElementById('hud-readout');
+
 const btnBlink = document.getElementById('btn-blink');
 const btnDipole = document.getElementById('btn-dipole');
+
 const targetCoordsEl = document.getElementById('target-coords');
 const btnFlag = document.getElementById('btn-flag');
 
 const tabExplorer = document.getElementById('tab-explorer');
 const tabCandidates = document.getElementById('tab-candidates');
+
 const viewExplorer = document.getElementById('view-explorer');
 const viewCandidates = document.getElementById('view-candidates');
 
@@ -92,15 +104,24 @@ function loadLocalArray(key) {
 }
 
 function saveLocalState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedCandidates));
-  localStorage.setItem(SCANNED_KEY, JSON.stringify([...scannedSectors]));
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(savedCandidates)
+    );
+
+    localStorage.setItem(
+      SCANNED_KEY,
+      JSON.stringify([...scannedSectors])
+    );
+  } catch (error) {
+    console.warn('Could not save local state:', error);
+  }
 }
 
 // ==========================================
 // 4. BACKEND CONNECTION
 // ==========================================
-
-let backendConnected = false;
 
 async function checkBackend() {
   try {
@@ -114,11 +135,11 @@ async function checkBackend() {
 
     backendConnected = data.status === 'ok';
 
-    console.log('PLANETX BACKEND:', data);
-
     if (!backendConnected) {
       throw new Error('Backend health check was unsuccessful.');
     }
+
+    console.log('PLANETX BACKEND:', data);
 
     return true;
 
@@ -156,7 +177,9 @@ async function loadAllSkyTiles() {
       );
 
       if (!response.ok) {
-        throw new Error(`Tile endpoint returned HTTP ${response.status}`);
+        throw new Error(
+          `Tile endpoint returned HTTP ${response.status}`
+        );
       }
 
       const data = await response.json();
@@ -169,12 +192,33 @@ async function loadAllSkyTiles() {
       }
 
       for (const tile of data.tiles) {
+
+        // Backend returns tile_id, not tile.id.
+        const tileId = Number(tile.tile_id);
+
+        if (
+          !Number.isInteger(tileId) ||
+          tileId < 0 ||
+          tileId >= TOTAL_SKY_TILES
+        ) {
+          console.warn('Skipping invalid tile:', tile);
+          continue;
+        }
+
+        const ra = Number(tile.ra);
+        const dec = Number(tile.dec);
+
+        if (!Number.isFinite(ra) || !Number.isFinite(dec)) {
+          console.warn('Skipping tile with invalid coordinates:', tile);
+          continue;
+        }
+
         SECTORS.push({
-          id: `TILE-${String(tile.id).padStart(5, '0')}`,
-          tileId: Number(tile.id),
-          index: Number(tile.id),
-          ra: Number(tile.ra),
-          dec: Number(tile.dec),
+          id: `TILE-${String(tileId).padStart(5, '0')}`,
+          tileId,
+          index: tileId,
+          ra,
+          dec,
           status: tile.status || 'not_checked'
         });
       }
@@ -191,6 +235,17 @@ async function loadAllSkyTiles() {
       );
     }
 
+    // Ensure there are no duplicate tile IDs.
+    const uniqueIds = new Set(
+      SECTORS.map(tile => tile.tileId)
+    );
+
+    if (uniqueIds.size !== TOTAL_SKY_TILES) {
+      throw new Error(
+        `Received ${uniqueIds.size} unique tile IDs instead of ${TOTAL_SKY_TILES}.`
+      );
+    }
+
     tilesLoaded = true;
 
     tileDataStatus =
@@ -204,7 +259,8 @@ async function loadAllSkyTiles() {
   } catch (error) {
     tilesLoaded = false;
 
-    tileDataStatus = `Could not load sky positions: ${error.message}`;
+    tileDataStatus =
+      `Could not load sky positions: ${error.message}`;
 
     console.error('FULL SKY LOAD ERROR:', error);
 
@@ -217,11 +273,11 @@ async function loadAllSkyTiles() {
 // ==========================================
 
 function openMissionModal() {
-  if (missionModal) missionModal.classList.remove('hidden');
+  missionModal?.classList.remove('hidden');
 }
 
 function closeMissionModal() {
-  if (missionModal) missionModal.classList.add('hidden');
+  missionModal?.classList.add('hidden');
 }
 
 function isModalOpen() {
@@ -245,7 +301,7 @@ missionModal?.addEventListener('click', event => {
 // ==========================================
 
 // Equirectangular display projection.
-// HEALPix tile centers are converted to screen positions.
+// Tile positions are based on their RA and Dec.
 
 function skyToScreen(ra, dec) {
   return {
@@ -273,17 +329,20 @@ function screenToSky(x, y) {
 // ==========================================
 
 function findSectorAtPoint(x, y) {
-  if (!SECTORS.length) return null;
+  if (!SECTORS.length || !canvas) return null;
 
   let closest = null;
   let closestDistance = Infinity;
 
   for (const sector of SECTORS) {
-    const point = skyToScreen(sector.ra, sector.dec);
+    const point = skyToScreen(
+      sector.ra,
+      sector.dec
+    );
 
     let dx = Math.abs(x - point.x);
 
-    // RA wraps around at 0° and 360°.
+    // Handle RA wraparound.
     dx = Math.min(dx, canvas.width - dx);
 
     const dy = y - point.y;
@@ -295,10 +354,6 @@ function findSectorAtPoint(x, y) {
     }
   }
 
-  // Choose the closest tile center.
-  // This allows users to select the nearest tile
-  // even when tile centers are close together.
-
   return closest;
 }
 
@@ -309,15 +364,19 @@ function findSectorAtPoint(x, y) {
 function renderAllSkyMap() {
   if (!canvas || !ctx) return;
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
 
-  ctx.fillStyle = '#020308';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // ----------------------------------------
+  // Coordinate grid
+  // ----------------------------------------
 
-  // Coordinate grid.
-
-  ctx.strokeStyle = 'rgba(100, 116, 139, 0.25)';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(100, 116, 139, 0.12)';
+  ctx.lineWidth = 0.7;
 
   for (let ra = 0; ra <= 360; ra += 30) {
     const x = (ra / 360) * canvas.width;
@@ -337,46 +396,63 @@ function renderAllSkyMap() {
     ctx.stroke();
   }
 
-  // Coordinate labels.
+  // ----------------------------------------
+  // Coordinate labels
+  // ----------------------------------------
 
-  ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
+  ctx.fillStyle = 'rgba(148, 163, 184, 0.65)';
   ctx.font = '10px monospace';
 
   for (let ra = 0; ra < 360; ra += 60) {
     const x = (ra / 360) * canvas.width + 4;
+
     ctx.fillText(`${ra}° RA`, x, 14);
   }
 
   for (let dec = -60; dec <= 60; dec += 30) {
     const y = ((90 - dec) / 180) * canvas.height;
+
     ctx.fillText(`${dec}°`, 5, y - 4);
   }
 
-  // Plot every HEALPix tile center.
+  // ----------------------------------------
+  // DRAW ALL 12,288 HEALPix TILE CENTERS
+  // ----------------------------------------
 
   for (const sector of SECTORS) {
-    const point = skyToScreen(sector.ra, sector.dec);
+    const point = skyToScreen(
+      sector.ra,
+      sector.dec
+    );
 
     const isHovered =
-      hoveredSector &&
-      hoveredSector.tileId === sector.tileId;
+      hoveredSector?.tileId === sector.tileId;
+
+    const isSelected =
+      activeSector?.tileId === sector.tileId;
 
     const hasCandidate = savedCandidates.some(
-      candidate => Number(candidate.tileId) === sector.tileId
+      candidate =>
+        Number(candidate.tileId ?? candidate.index) === sector.tileId
     );
 
     const isScanned = scannedSectors.has(
       String(sector.tileId)
     );
 
+    // Candidate: orange
+    // Scanned: green
+    // Normal tile: blue
+    // Hovered: bright cyan
+
     if (hasCandidate) {
-      ctx.fillStyle = '#f59e0b';
-    } else if (isHovered) {
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.95)';
     } else if (isScanned) {
-      ctx.fillStyle = '#22c55e';
+      ctx.fillStyle = 'rgba(34, 197, 94, 0.95)';
+    } else if (isHovered || isSelected) {
+      ctx.fillStyle = 'rgba(56, 189, 248, 1)';
     } else {
-      ctx.fillStyle = 'rgba(125, 211, 252, 0.65)';
+      ctx.fillStyle = 'rgba(56, 189, 248, 0.72)';
     }
 
     ctx.beginPath();
@@ -384,36 +460,45 @@ function renderAllSkyMap() {
     ctx.arc(
       point.x,
       point.y,
-      isHovered ? 4 : 1.5,
+      isHovered || isSelected ? 3.2 : 1.6,
       0,
       Math.PI * 2
     );
 
     ctx.fill();
+
+    // Selected tile ring.
+    if (isSelected) {
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.arc(
+        point.x,
+        point.y,
+        8,
+        0,
+        Math.PI * 2
+      );
+
+      ctx.stroke();
+    }
   }
 
-  // Highlight selected tile.
+  // ----------------------------------------
+  // MAP STATUS
+  // ----------------------------------------
 
-  if (activeSector) {
-    const point = skyToScreen(
-      activeSector.ra,
-      activeSector.dec
-    );
-
-    ctx.strokeStyle = '#22c55e';
-    ctx.lineWidth = 2;
-
-    ctx.beginPath();
-    ctx.arc(point.x, point.y, 8, 0, Math.PI * 2);
-    ctx.stroke();
+  if (viewportModeTag) {
+    viewportModeTag.textContent =
+      `FULL SKY // ${SECTORS.length.toLocaleString()} HEALPIX TILES`;
   }
 
-  viewportModeTag.textContent =
-    'FULL SKY // HEALPIX NESTED // 12,288 TILE POSITIONS';
-
-  hudReadout.textContent = hoveredSector
-    ? `TILE ${hoveredSector.tileId} | RA ${hoveredSector.ra.toFixed(3)}° | DEC ${hoveredSector.dec.toFixed(3)}°`
-    : tileDataStatus;
+  if (hudReadout) {
+    hudReadout.textContent = hoveredSector
+      ? `TILE ${hoveredSector.tileId} | RA ${hoveredSector.ra.toFixed(3)}° | DEC ${hoveredSector.dec.toFixed(3)}°`
+      : tileDataStatus;
+  }
 }
 
 // ==========================================
@@ -423,10 +508,21 @@ function renderAllSkyMap() {
 function renderSectorView() {
   if (!canvas || !ctx) return;
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.clearRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
 
   ctx.fillStyle = '#020308';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.fillRect(
+    0,
+    0,
+    canvas.width,
+    canvas.height
+  );
 
   if (realObservation && epoch1Source) {
     ctx.drawImage(
@@ -437,11 +533,15 @@ function renderSectorView() {
       canvas.height
     );
 
-    viewportModeTag.textContent =
-      'REAL SPHEREx DR1 // HiPS PNG TILE';
+    if (viewportModeTag) {
+      viewportModeTag.textContent =
+        'REAL SPHEREx DR1 // HiPS PNG TILE';
+    }
 
-    hudReadout.textContent =
-      `HEALPix TILE ${activeSector.tileId} | CHANNEL ${bandSlider.value}`;
+    if (hudReadout) {
+      hudReadout.textContent =
+        `HEALPix TILE ${activeSector.tileId} | CHANNEL ${bandSlider.value}`;
+    }
 
     return;
   }
@@ -462,10 +562,14 @@ function renderSectorView() {
 
   ctx.textAlign = 'start';
 
-  viewportModeTag.textContent =
-    'SPHEREx TILE // WAITING FOR IMAGE';
+  if (viewportModeTag) {
+    viewportModeTag.textContent =
+      'SPHEREx TILE // WAITING FOR IMAGE';
+  }
 
-  hudReadout.textContent = tileDataStatus;
+  if (hudReadout) {
+    hudReadout.textContent = tileDataStatus;
+  }
 }
 
 function renderFrame() {
@@ -477,7 +581,27 @@ function renderFrame() {
 }
 
 // ==========================================
-// 11. LOAD A REAL SPHEREx PNG TILE
+// 11. IMAGE URL NORMALIZATION
+// ==========================================
+
+function normalizeImageUrl(data) {
+  if (data.data_url) {
+    return data.data_url;
+  }
+
+  if (!data.image) {
+    return null;
+  }
+
+  if (data.image.startsWith('data:image/')) {
+    return data.image;
+  }
+
+  return `data:image/png;base64,${data.image}`;
+}
+
+// ==========================================
+// 12. LOAD A REAL SPHEREx PNG TILE
 // ==========================================
 
 async function loadSkyPatch(channel) {
@@ -501,9 +625,11 @@ async function loadSkyPatch(channel) {
   renderSectorView();
 
   try {
+    // Send the HEALPix tile ID directly.
+    // The backend supports tile and channel parameters.
+
     const params = new URLSearchParams({
-      ra: String(activeSector.ra),
-      dec: String(activeSector.dec),
+      tile: String(activeSector.tileId),
       channel: String(frame)
     });
 
@@ -523,13 +649,12 @@ async function loadSkyPatch(channel) {
       );
     }
 
-    const imageUrl = data.data_url ||
-      (data.image
-        ? `data:image/png;base64,${data.image}`
-        : null);
+    const imageUrl = normalizeImageUrl(data);
 
     if (!imageUrl) {
-      throw new Error('No image was returned by the archive.');
+      throw new Error(
+        'No image was returned by the archive.'
+      );
     }
 
     const image = new Image();
@@ -554,20 +679,22 @@ async function loadSkyPatch(channel) {
     tileDataStatus =
       `REAL SPHEREx DATA | Tile ${data.tile_id} | Channel ${frame}`;
 
-    targetCoordsEl.textContent =
-      `RA ${activeSector.ra.toFixed(4)}° | DEC ${activeSector.dec.toFixed(4)}°`;
+    if (targetCoordsEl) {
+      targetCoordsEl.textContent =
+        `RA ${activeSector.ra.toFixed(4)}° | DEC ${activeSector.dec.toFixed(4)}°`;
+    }
 
-    btnBlink.disabled = true;
-    btnDipole.disabled = true;
-    btnFlag.disabled = true;
+    if (btnBlink) btnBlink.disabled = true;
+    if (btnDipole) btnDipole.disabled = true;
+    if (btnFlag) btnFlag.disabled = true;
 
     renderSectorView();
 
     console.log('REAL SPHEREx TILE LOADED:', {
       tile: data.tile_id,
       channel: frame,
-      width: data.image_width,
-      height: data.image_height,
+      width: image.naturalWidth,
+      height: image.naturalHeight,
       source: data.source
     });
 
@@ -589,56 +716,66 @@ async function loadSkyPatch(channel) {
 }
 
 // ==========================================
-// 12. ENTER A SKY TILE
+// 13. ENTER A SKY TILE
 // ==========================================
 
 async function enterSector(sector) {
   if (!sector) return;
 
   activeSector = sector;
+  hoveredSector = null;
   viewportLevel = 'sector';
 
   realObservation = false;
   epoch1Source = null;
 
-  canvas.classList.add('sector-mode');
+  canvas?.classList.add('sector-mode');
 
-  sectorTitleEl.textContent =
-    `Sky Tile ${sector.tileId}`;
+  if (sectorTitleEl) {
+    sectorTitleEl.textContent =
+      `Sky Tile ${sector.tileId}`;
+  }
 
-  sectorBadge.textContent =
-    `HEALPix NESTED | RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
+  if (sectorBadge) {
+    sectorBadge.textContent =
+      `HEALPix NESTED | RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
+  }
 
-  targetCoordsEl.textContent =
-    `RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
+  if (targetCoordsEl) {
+    targetCoordsEl.textContent =
+      `RA ${sector.ra.toFixed(4)}° | DEC ${sector.dec.toFixed(4)}°`;
+  }
 
-  btnBackAllSky.disabled = false;
-  btnMarkClear.disabled = false;
+  if (btnBackAllSky) btnBackAllSky.disabled = false;
+  if (btnMarkClear) btnMarkClear.disabled = false;
 
-  // These controls are disabled because a single PNG
-  // does not provide two epochs or a calibrated spectrum.
+  if (btnBlink) btnBlink.disabled = true;
+  if (btnDipole) btnDipole.disabled = true;
+  if (btnFlag) btnFlag.disabled = true;
 
-  btnBlink.disabled = true;
-  btnDipole.disabled = true;
-  btnFlag.disabled = true;
-
-  btnFlag.textContent = 'Candidate Detection Not Available';
+  if (btnFlag) {
+    btnFlag.textContent =
+      'Candidate Detection Not Available';
+  }
 
   if (spectrumChart) {
-    spectrumChart.data.datasets[0].data = Array(TOTAL_CHANNELS).fill(0);
-    spectrumChart.data.datasets[0].label = 'No extracted spectrum';
+    spectrumChart.data.datasets[0].data =
+      Array(TOTAL_CHANNELS).fill(0);
+
+    spectrumChart.data.datasets[0].label =
+      'No extracted spectrum';
+
     spectrumChart.update();
   }
 
-  await loadSkyPatch(Number(bandSlider.value));
+  await loadSkyPatch(Number(bandSlider?.value || 1));
 }
 
 // ==========================================
-// 13. RETURN TO FULL SKY
+// 14. RETURN TO FULL SKY
 // ==========================================
 
 function returnToAllSky() {
-  // Invalidate any outstanding image request.
   tileRequestNumber++;
 
   viewportLevel = 'allsky';
@@ -647,21 +784,27 @@ function returnToAllSky() {
   realObservation = false;
   epoch1Source = null;
 
-  canvas.classList.remove('sector-mode');
+  canvas?.classList.remove('sector-mode');
 
-  sectorTitleEl.textContent = 'Full-Sky Survey';
+  if (sectorTitleEl) {
+    sectorTitleEl.textContent = 'Full-Sky Survey';
+  }
 
-  sectorBadge.textContent =
-    `${TOTAL_SKY_TILES.toLocaleString()} HEALPix tile positions`;
+  if (sectorBadge) {
+    sectorBadge.textContent =
+      `${TOTAL_SKY_TILES.toLocaleString()} HEALPix tile positions`;
+  }
 
-  targetCoordsEl.textContent =
-    'Select a sky tile to retrieve its SPHEREx image.';
+  if (targetCoordsEl) {
+    targetCoordsEl.textContent =
+      'Select a sky tile to retrieve its SPHEREx image.';
+  }
 
-  btnBackAllSky.disabled = true;
-  btnMarkClear.disabled = true;
-  btnBlink.disabled = true;
-  btnDipole.disabled = true;
-  btnFlag.disabled = true;
+  if (btnBackAllSky) btnBackAllSky.disabled = true;
+  if (btnMarkClear) btnMarkClear.disabled = true;
+  if (btnBlink) btnBlink.disabled = true;
+  if (btnDipole) btnDipole.disabled = true;
+  if (btnFlag) btnFlag.disabled = true;
 
   tileDataStatus =
     `${SECTORS.length.toLocaleString()} tile positions loaded.`;
@@ -670,13 +813,14 @@ function returnToAllSky() {
 }
 
 // ==========================================
-// 14. SPECTRUM CHART
+// 15. SPECTRUM CHART
 // ==========================================
 
 let spectrumChart = null;
 
 if (typeof Chart !== 'undefined') {
-  const spectrumCanvas = document.getElementById('spectrum-chart');
+  const spectrumCanvas =
+    document.getElementById('spectrum-chart');
 
   if (spectrumCanvas) {
     spectrumChart = new Chart(
@@ -706,7 +850,9 @@ if (typeof Chart !== 'undefined') {
           maintainAspectRatio: false,
 
           plugins: {
-            legend: { display: false }
+            legend: {
+              display: false
+            }
           },
 
           scales: {
@@ -716,7 +862,9 @@ if (typeof Chart !== 'undefined') {
                 maxTicksLimit: 8
               },
 
-              grid: { color: '#1f293d' },
+              grid: {
+                color: '#1f293d'
+              },
 
               title: {
                 display: true,
@@ -726,8 +874,13 @@ if (typeof Chart !== 'undefined') {
             },
 
             y: {
-              ticks: { color: '#94a3b8' },
-              grid: { color: '#1f293d' }
+              ticks: {
+                color: '#94a3b8'
+              },
+
+              grid: {
+                color: '#1f293d'
+              }
             }
           }
         }
@@ -737,17 +890,31 @@ if (typeof Chart !== 'undefined') {
 }
 
 // ==========================================
-// 15. TAB NAVIGATION
+// 16. TAB NAVIGATION
 // ==========================================
 
 function switchTab(tabName) {
   const isExplorer = tabName === 'explorer';
 
-  viewExplorer.classList.toggle('hidden', !isExplorer);
-  viewCandidates.classList.toggle('hidden', isExplorer);
+  viewExplorer?.classList.toggle(
+    'hidden',
+    !isExplorer
+  );
 
-  tabExplorer.classList.toggle('active', isExplorer);
-  tabCandidates.classList.toggle('active', !isExplorer);
+  viewCandidates?.classList.toggle(
+    'hidden',
+    isExplorer
+  );
+
+  tabExplorer?.classList.toggle(
+    'active',
+    isExplorer
+  );
+
+  tabCandidates?.classList.toggle(
+    'active',
+    !isExplorer
+  );
 
   if (isExplorer) {
     renderFrame();
@@ -755,26 +922,36 @@ function switchTab(tabName) {
 }
 
 // ==========================================
-// 16. UPDATE COUNTERS AND MEMORY
+// 17. UPDATE COUNTERS AND MEMORY
 // ==========================================
 
 function syncMemory() {
   saveLocalState();
 
-  candidateCountEl.textContent =
-    String(savedCandidates.length);
+  if (candidateCountEl) {
+    candidateCountEl.textContent =
+      String(savedCandidates.length);
+  }
 
-  bannerScannedEl.textContent =
-    `${String(scannedSectors.size).padStart(2, '0')}/${TOTAL_SKY_TILES}`;
+  if (bannerScannedEl) {
+    bannerScannedEl.textContent =
+      `${String(scannedSectors.size).padStart(2, '0')}/${TOTAL_SKY_TILES}`;
+  }
 
-  bannerFlaggedEl.textContent =
-    String(savedCandidates.length).padStart(2, '0');
+  if (bannerFlaggedEl) {
+    bannerFlaggedEl.textContent =
+      String(savedCandidates.length).padStart(2, '0');
+  }
 
   renderCandidatesTable();
+
+  if (viewportLevel === 'allsky') {
+    renderAllSkyMap();
+  }
 }
 
 // ==========================================
-// 17. CANDIDATE TABLE
+// 18. CANDIDATE TABLE
 // ==========================================
 
 function renderCandidatesTable() {
@@ -798,11 +975,14 @@ function renderCandidatesTable() {
   savedCandidates.forEach((item, index) => {
     const row = document.createElement('tr');
 
-    const tileId = Number(item.tileId ?? item.index ?? 0);
+    const tileId = Number(
+      item.tileId ?? item.index ?? 0
+    );
 
     const cells = [
       `SPX-${String(index + 1).padStart(3, '0')}`,
-      item.sectorId || `TILE-${String(tileId).padStart(5, '0')}`,
+      item.sectorId ||
+        `TILE-${String(tileId).padStart(5, '0')}`,
       `${Number(item.ra).toFixed(4)}°, ${Number(item.dec).toFixed(4)}°`,
       `(${item.pixel_x ?? '-'}, ${item.pixel_y ?? '-'})`,
       `Channel ${item.band ?? '-'}`,
@@ -830,13 +1010,18 @@ function renderCandidatesTable() {
       );
 
       if (!target) {
-        alert('This tile is not currently available in the loaded map.');
+        alert(
+          'This tile is not currently available in the loaded map.'
+        );
         return;
       }
 
       switchTab('explorer');
 
-      bandSlider.value = item.band || 1;
+      if (bandSlider) {
+        bandSlider.value = item.band || 1;
+      }
+
       enterSector(target);
     });
 
@@ -848,7 +1033,7 @@ function renderCandidatesTable() {
 }
 
 // ==========================================
-// 18. CANVAS COORDINATES
+// 19. CANVAS COORDINATES
 // ==========================================
 
 function getCanvasCoords(event) {
@@ -868,10 +1053,10 @@ function getCanvasCoords(event) {
 }
 
 // ==========================================
-// 19. MAP HOVER
+// 20. MAP HOVER
 // ==========================================
 
-canvas.addEventListener('mousemove', event => {
+canvas?.addEventListener('mousemove', event => {
   if (viewportLevel !== 'allsky' || !tilesLoaded) {
     return;
   }
@@ -888,16 +1073,26 @@ canvas.addEventListener('mousemove', event => {
   }
 });
 
+canvas?.addEventListener('mouseleave', () => {
+  if (viewportLevel === 'allsky') {
+    hoveredSector = null;
+    renderAllSkyMap();
+  }
+});
+
 // ==========================================
-// 20. MAP CLICK
+// 21. MAP CLICK
 // ==========================================
 
-canvas.addEventListener('click', event => {
+canvas?.addEventListener('click', event => {
   const { x, y } = getCanvasCoords(event);
 
   if (viewportLevel === 'allsky') {
     if (!tilesLoaded) {
-      hudReadout.textContent = 'Sky tiles are still loading.';
+      if (hudReadout) {
+        hudReadout.textContent =
+          'Sky tiles are still loading.';
+      }
       return;
     }
 
@@ -907,24 +1102,27 @@ canvas.addEventListener('click', event => {
       switchTab('explorer');
       enterSector(clickedTile);
     }
-
-    return;
   }
 });
 
 // ==========================================
-// 21. SEARCH SKY TILE
+// 22. SEARCH SKY TILE
 // ==========================================
 
-sectorSearchInput.addEventListener('keydown', event => {
+sectorSearchInput?.addEventListener('keydown', event => {
   if (event.key !== 'Enter') return;
 
   if (!tilesLoaded) {
-    hudReadout.textContent = 'Sky tile positions are still loading.';
+    if (hudReadout) {
+      hudReadout.textContent =
+        'Sky tile positions are still loading.';
+    }
     return;
   }
 
-  const raw = sectorSearchInput.value.trim().toUpperCase();
+  const raw = sectorSearchInput.value
+    .trim()
+    .toUpperCase();
 
   const number = parseInt(
     raw.replace(/[^0-9]/g, ''),
@@ -940,14 +1138,14 @@ sectorSearchInput.addEventListener('keydown', event => {
     switchTab('explorer');
     enterSector(match);
     sectorSearchInput.value = '';
-  } else {
+  } else if (hudReadout) {
     hudReadout.textContent =
       'Tile not found. Enter a tile ID from 0 to 12287.';
   }
 });
 
 // ==========================================
-// 22. NAVIGATION
+// 23. NAVIGATION
 // ==========================================
 
 logoHome?.addEventListener('click', event => {
@@ -966,23 +1164,28 @@ tabCandidates?.addEventListener('click', () => {
   switchTab('candidates');
 });
 
-btnBackAllSky?.addEventListener('click', returnToAllSky);
+btnBackAllSky?.addEventListener(
+  'click',
+  returnToAllSky
+);
 
 // ==========================================
-// 23. MARK TILE AS SCANNED
+// 24. MARK TILE AS SCANNED
 // ==========================================
 
 btnMarkClear?.addEventListener('click', () => {
   if (!activeSector) return;
 
-  scannedSectors.add(String(activeSector.tileId));
+  scannedSectors.add(
+    String(activeSector.tileId)
+  );
 
   syncMemory();
   returnToAllSky();
 });
 
 // ==========================================
-// 24. CHANNEL SLIDER
+// 25. CHANNEL SLIDER
 // ==========================================
 
 if (bandSlider) {
@@ -993,49 +1196,67 @@ if (bandSlider) {
   bandSlider.addEventListener('input', event => {
     const channel = Math.max(
       1,
-      Math.min(TOTAL_CHANNELS, Number(event.target.value))
+      Math.min(
+        TOTAL_CHANNELS,
+        Number(event.target.value)
+      )
     );
 
-    bandLabel.textContent = `Channel ${channel}`;
+    if (bandLabel) {
+      bandLabel.textContent =
+        `Channel ${channel}`;
+    }
 
-    bannerBandEl.textContent =
-      String(channel).padStart(3, '0');
+    if (bannerBandEl) {
+      bannerBandEl.textContent =
+        String(channel).padStart(3, '0');
+    }
 
-    // The actual wavelength values are non-uniform.
-    // This frontend does not invent wavelength values.
+    // Exact wavelength values are not calculated here.
+    if (bannerWavelengthEl) {
+      bannerWavelengthEl.textContent = 'SPHEREx';
+    }
 
-    bannerWavelengthEl.textContent = 'SPHEREx';
-
-    if (viewportLevel === 'sector' && activeSector) {
+    if (
+      viewportLevel === 'sector' &&
+      activeSector
+    ) {
       loadSkyPatch(channel);
     }
   });
 }
 
 // ==========================================
-// 25. DISABLE UNSUPPORTED ANALYSIS CONTROLS
+// 26. DISABLE UNSUPPORTED ANALYSIS CONTROLS
 // ==========================================
 
-btnBlink.disabled = true;
-btnDipole.disabled = true;
-btnFlag.disabled = true;
+if (btnBlink) btnBlink.disabled = true;
+if (btnDipole) btnDipole.disabled = true;
+if (btnFlag) btnFlag.disabled = true;
 
 btnBlink?.addEventListener('click', () => {
-  hudReadout.textContent =
-    'Blink comparison requires separate calibrated observations.';
+  if (hudReadout) {
+    hudReadout.textContent =
+      'Blink comparison requires separate calibrated observations.';
+  }
 });
 
 btnDipole?.addEventListener('click', () => {
-  hudReadout.textContent =
-    'Difference imaging requires separate aligned observations.';
+  if (hudReadout) {
+    hudReadout.textContent =
+      'Difference imaging requires separate aligned observations.';
+  }
 });
 
 // ==========================================
-// 26. KEYBOARD CONTROLS
+// 27. KEYBOARD CONTROLS
 // ==========================================
 
 window.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && isModalOpen()) {
+  if (
+    event.key === 'Escape' &&
+    isModalOpen()
+  ) {
     closeMissionModal();
     return;
   }
@@ -1049,7 +1270,7 @@ window.addEventListener('keydown', event => {
 });
 
 // ==========================================
-// 27. EXPORT CANDIDATES
+// 28. EXPORT CANDIDATES
 // ==========================================
 
 btnExportJson?.addEventListener('click', () => {
@@ -1059,8 +1280,8 @@ btnExportJson?.addEventListener('click', () => {
   );
 
   const url = URL.createObjectURL(blob);
-
   const link = document.createElement('a');
+
   link.href = url;
   link.download = 'planetx_candidates.json';
 
@@ -1070,7 +1291,7 @@ btnExportJson?.addEventListener('click', () => {
 });
 
 // ==========================================
-// 28. CLEAR CANDIDATES
+// 29. CLEAR CANDIDATES
 // ==========================================
 
 btnClearLog?.addEventListener('click', () => {
@@ -1085,20 +1306,29 @@ btnClearLog?.addEventListener('click', () => {
 });
 
 // ==========================================
-// 29. INITIALIZE APPLICATION
+// 30. INITIALIZE APPLICATION
 // ==========================================
 
 async function initializePlanetX() {
   syncMemory();
 
-  bandSlider.min = 1;
-  bandSlider.max = TOTAL_CHANNELS;
-  bandSlider.value = 1;
+  if (bandSlider) {
+    bandSlider.min = 1;
+    bandSlider.max = TOTAL_CHANNELS;
+    bandSlider.value = 1;
+  }
 
-  bandLabel.textContent = 'Channel 1';
+  if (bandLabel) {
+    bandLabel.textContent = 'Channel 1';
+  }
 
-  bannerBandEl.textContent = '001';
-  bannerWavelengthEl.textContent = 'SPHEREx';
+  if (bannerBandEl) {
+    bannerBandEl.textContent = '001';
+  }
+
+  if (bannerWavelengthEl) {
+    bannerWavelengthEl.textContent = 'SPHEREx';
+  }
 
   renderAllSkyMap();
 
